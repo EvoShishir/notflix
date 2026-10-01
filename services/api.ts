@@ -344,7 +344,9 @@ class ApiService {
     }
   }
 
-  convertSearchAPIPostToVideo(post: SearchAPIPost): Video {
+  // Always returns a discriminated Movie | TVShow (see the branches below),
+  // so the annotation is VideoType rather than the base Video.
+  convertSearchAPIPostToVideo(post: SearchAPIPost): VideoType {
     const isSeries = post.type === "series";
     const genres = this.extractGenresFromQuality(post.quality || "");
     const description = post.metaData || post.title || post.name;

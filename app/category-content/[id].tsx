@@ -1,313 +1,277 @@
 import OptimizedVideoCard from "@/components/OptimizedVideoCard";
+import { AppText } from "@/components/ui/AppText";
+import { useMotion } from "@/components/ui/Motion";
+import {
+  LargeTitle,
+  StickyHeaderBar,
+  useStickyHeaderHeight,
+} from "@/components/ui/ScreenHeader";
+import { GridSkeleton, SkeletonGroup } from "@/components/ui/Skeleton";
+import { EmptyState, ErrorState } from "@/components/ui/StateViews";
+import {
+  gutterFor,
+  Palette,
+  POSTER_ASPECT,
+  Spacing,
+} from "@/constants/theme";
 import { apiService } from "@/services/api";
 import { VideoType } from "@/types";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  FlatList,
-  Pressable,
-  StatusBar,
+  RefreshControl,
   StyleSheet,
-  Text,
+  useWindowDimensions,
   View,
 } from "react-native";
+import Animated, {
+  useAnimatedScrollHandler,
+  useSharedValue,
+} from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+const PAGE_SIZE = 50;
+
+function columnsFor(width: number) {
+  if (width >= 1200) return 6;
+  if (width >= 1000) return 5;
+  if (width >= 800) return 4;
+  if (width >= 600) return 3;
+  return 2;
+}
 
 export default function CategoryContentScreen() {
   const { id, name } = useLocalSearchParams<{ id: string; name: string }>();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const { enter } = useMotion();
+  const headerHeight = useStickyHeaderHeight();
 
   const [videos, setVideos] = useState<VideoType[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [currentPage, setCurrentPage] = useState(1);
-  const [hasMoreData, setHasMoreData] = useState(true);
-  const [totalPages, setTotalPages] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
 
-  const flatListRef = useRef<FlatList>(null);
+  /**
+   * Page lives in a ref, not state: it is only ever read inside the fetch, and
+   * keeping it out of the dependency array is what stops the load effect from
+   * re-firing every time a page lands.
+   */
+  const pageRef = useRef(1);
+  const scrollY = useSharedValue(0);
 
-  useEffect(() => {
-    fetchCategoryContent(true);
-  }, [id, fetchCategoryContent]);
+  const columns = columnsFor(width);
+  const gutter = gutterFor(width);
 
-  const fetchCategoryContent = useCallback(
-    async (isRefresh: boolean = false) => {
+  const { cardWidth, cardHeight } = useMemo(() => {
+    const available = width - gutter * 2 - Spacing.sm * (columns - 1);
+    const w = Math.floor(available / columns);
+    return { cardWidth: w, cardHeight: Math.round(w / POSTER_ASPECT) };
+  }, [width, columns, gutter]);
+
+  const scrollHandler = useAnimatedScrollHandler((e) => {
+    scrollY.value = e.contentOffset.y;
+  });
+
+  const load = useCallback(
+    async (mode: "initial" | "refresh" | "more") => {
+      const fresh = mode !== "more";
       try {
-        if (isRefresh) {
-          setLoading(true);
-          setCurrentPage(1);
-          setVideos([]);
-          setHasMoreData(true);
-        } else {
-          setLoadingMore(true);
-        }
-
+        if (mode === "initial") setLoading(true);
+        if (mode === "refresh") setRefreshing(true);
+        if (mode === "more") setLoadingMore(true);
         setError(null);
 
-        const page = isRefresh ? 1 : currentPage + 1;
-
-        const data = await apiService.fetchCategoryPosts(id, page, 50);
-
-        // The API service now normalizes the response format
-        const posts = data.posts || [];
-
-        const newVideos = posts.map((post) =>
+        const page = fresh ? 1 : pageRef.current + 1;
+        const data = await apiService.fetchCategoryPosts(id, page, PAGE_SIZE);
+        const posts = data.posts ?? [];
+        const incoming = posts.map((post) =>
           apiService.convertSearchAPIPostToVideo(post)
         );
 
-        if (isRefresh) {
-          setVideos(newVideos);
+        if (fresh) {
+          setVideos(incoming);
         } else {
-          setVideos((prevVideos) => {
-            // Filter out duplicates based on video ID
-            const existingIds = new Set(prevVideos.map((video) => video.id));
-            const uniqueNewVideos = newVideos.filter(
-              (video) => !existingIds.has(video.id)
-            );
-            return [...prevVideos, ...uniqueNewVideos];
+          setVideos((prev) => {
+            const seen = new Set(prev.map((v) => v.id));
+            return [...prev, ...incoming.filter((v) => !seen.has(v.id))];
           });
         }
 
-        // Update pagination info
-        if (data.pagination && data.pagination.totalPages !== undefined) {
-          setTotalPages(data.pagination.totalPages);
-          setHasMoreData(page < data.pagination.totalPages);
-        } else {
-          // If no pagination info or totalPages is undefined, assume we have more data if we got a full page
-          setHasMoreData(posts.length === 50);
-        }
-
-        if (!isRefresh) {
-          setCurrentPage((prev) => prev + 1);
-        }
-      } catch (error) {
-        setError("Failed to load content. Please try again.");
+        pageRef.current = page;
+        setHasMore(
+          data.pagination?.totalPages !== undefined
+            ? page < data.pagination.totalPages
+            : posts.length === PAGE_SIZE
+        );
+      } catch {
+        setError("We couldn't load this collection.");
       } finally {
         setLoading(false);
+        setRefreshing(false);
         setLoadingMore(false);
       }
     },
-    [id, currentPage]
+    [id]
   );
 
+  useEffect(() => {
+    pageRef.current = 1;
+    load("initial");
+  }, [load]);
+
   const handleLoadMore = useCallback(() => {
-    if (!loadingMore && hasMoreData) {
-      fetchCategoryContent(false);
-    }
-  }, [loadingMore, hasMoreData, fetchCategoryContent]);
+    if (!loading && !loadingMore && !refreshing && hasMore) load("more");
+  }, [loading, loadingMore, refreshing, hasMore, load]);
 
-  const handleRefresh = useCallback(() => {
-    fetchCategoryContent(true);
-  }, [id]);
-
-  const handleVideoPress = useCallback(
-    (videoId: string) => {
-      router.push(`/video/${videoId}`);
-    },
+  const openVideo = useCallback(
+    (videoId: string) => router.push(`/video/${videoId}`),
     [router]
   );
 
-  const renderVideoItem = useCallback(
-    ({ item, index }: { item: VideoType; index: number }) => (
+  const renderItem = useCallback(
+    ({ item }: { item: VideoType }) => (
       <OptimizedVideoCard
         video={item}
-        onPress={() => handleVideoPress(item.id)}
-        width={165}
-        height={250}
+        width={cardWidth}
+        height={cardHeight}
+        onPress={openVideo}
       />
     ),
-    [handleVideoPress]
+    [cardWidth, cardHeight, openVideo]
   );
-
-  const renderFooter = useCallback(() => {
-    if (!loadingMore) return null;
-
-    return (
-      <View style={styles.loadingFooter}>
-        <ActivityIndicator size="small" color="#e50914" />
-        <Text style={styles.loadingFooterText}>Loading more...</Text>
-      </View>
-    );
-  }, [loadingMore]);
-
-  const renderEmpty = useCallback(() => {
-    if (loading) return null;
-
-    return (
-      <View style={styles.emptyContainer}>
-        <Text style={styles.emptyText}>No content available</Text>
-        <Text style={styles.emptySubtext}>
-          This category doesn't have any content yet
-        </Text>
-      </View>
-    );
-  }, [loading]);
 
   if (loading) {
     return (
-      <View style={styles.loadingContainer}>
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
-        <ActivityIndicator size="large" color="#e50914" />
-        <Text style={styles.loadingText}>Loading content...</Text>
+      <View style={styles.container}>
+        <StickyHeaderBar title={name ?? "Collection"} scrollY={scrollY} />
+        <SkeletonGroup label={`Loading ${name ?? "collection"}`}>
+          <View style={{ paddingTop: headerHeight + Spacing.xl }}>
+            <GridSkeleton
+              columns={columns}
+              cardWidth={cardWidth}
+              cardHeight={cardHeight}
+              gutter={gutter}
+              count={columns * 3}
+            />
+          </View>
+        </SkeletonGroup>
       </View>
     );
   }
 
-  if (error) {
+  if (error && videos.length === 0) {
     return (
-      <View style={styles.errorContainer}>
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
-        <Text style={styles.errorText}>{error}</Text>
-        <Pressable style={styles.retryButton} onPress={fetchCategoryContent}>
-          <Text style={styles.retryButtonText}>Retry</Text>
-        </Pressable>
+      <View style={styles.container}>
+        <StickyHeaderBar title={name ?? "Collection"} scrollY={scrollY} />
+        <View style={styles.centered}>
+          <ErrorState
+            title="Couldn't load this collection"
+            message={error}
+            onRetry={() => load("initial")}
+          />
+        </View>
       </View>
     );
   }
 
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000" />
+      <StickyHeaderBar title={name ?? "Collection"} scrollY={scrollY} />
 
-      <View style={styles.header}>
-        <Pressable style={styles.backButton} onPress={() => router.back()}>
-          <Text style={styles.backButtonText}>‹</Text>
-        </Pressable>
-        <Text style={styles.headerTitle}>{name}</Text>
-        <Text style={styles.headerSubtitle}>
-          {videos.length} {videos.length === 1 ? "item" : "items"}
-        </Text>
-      </View>
-
-      <FlatList
-        ref={flatListRef}
+      <Animated.FlatList
+        key={`content-${columns}`}
         data={videos}
-        renderItem={renderVideoItem}
-        numColumns={2}
+        renderItem={renderItem}
+        numColumns={columns}
         keyExtractor={(item) => item.id}
+        onScroll={scrollHandler}
+        scrollEventThrottle={16}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.listContent}
-        columnWrapperStyle={styles.row}
-        initialNumToRender={10}
-        maxToRenderPerBatch={10}
-        windowSize={10}
-        removeClippedSubviews={true}
+        columnWrapperStyle={columns > 1 ? styles.row : undefined}
+        contentContainerStyle={{
+          paddingHorizontal: gutter,
+          paddingBottom: insets.bottom + Spacing.xxl,
+        }}
+        ListHeaderComponent={
+          <LargeTitle
+            eyebrow="Collection"
+            title={name ?? "Collection"}
+            subtitle={`${videos.length}${hasMore ? "+" : ""} title${
+              videos.length === 1 ? "" : "s"
+            }`}
+            offset={headerHeight}
+            style={styles.title}
+          />
+        }
+        ListEmptyComponent={
+          <EmptyState
+            icon="film-outline"
+            title="Nothing here yet"
+            message="This collection has no titles at the moment."
+            actionLabel="Refresh"
+            onAction={() => load("refresh")}
+          />
+        }
+        ListFooterComponent={
+          <>
+            {loadingMore && (
+              <View style={styles.footer}>
+                <ActivityIndicator size="small" color={Palette.accent} />
+                <AppText variant="small" tone="muted">
+                  Loading more…
+                </AppText>
+              </View>
+            )}
+            {/* A failure while paginating shouldn't wipe what's already loaded. */}
+            {error && videos.length > 0 && (
+              <Animated.View entering={enter.fade(0)} style={styles.footer}>
+                <AppText
+                  variant="small"
+                  tone="muted"
+                  accessibilityLiveRegion="polite"
+                >
+                  {error}
+                </AppText>
+              </Animated.View>
+            )}
+          </>
+        }
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => load("refresh")}
+            tintColor={Palette.accent}
+            colors={[Palette.accent]}
+            progressBackgroundColor={Palette.card}
+            progressViewOffset={headerHeight}
+          />
+        }
         onEndReached={handleLoadMore}
-        onEndReachedThreshold={0.5}
-        onRefresh={handleRefresh}
-        refreshing={loading}
-        ListFooterComponent={renderFooter}
-        ListEmptyComponent={renderEmpty}
-        getItemLayout={(data, index) => ({
-          length: 270, // height + margin
-          offset: 270 * Math.floor(index / 2),
-          index,
-        })}
+        onEndReachedThreshold={0.6}
+        initialNumToRender={columns * 3}
+        maxToRenderPerBatch={columns * 2}
+        windowSize={9}
+        removeClippedSubviews
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#000",
-  },
-  header: {
-    paddingHorizontal: 16,
-    paddingTop: 60,
-    paddingBottom: 20,
-  },
-  backButton: {
-    marginBottom: 16,
-  },
-  backButtonText: {
-    color: "#e50914",
-    fontSize: 24,
-    fontWeight: "bold",
-  },
-  headerTitle: {
-    color: "#fff",
-    fontSize: 24,
-    fontWeight: "bold",
-    marginBottom: 4,
-  },
-  headerSubtitle: {
-    color: "#999",
-    fontSize: 14,
-  },
-  listContent: {
-    paddingHorizontal: 16,
-    paddingBottom: 100,
-  },
-  row: {
-    justifyContent: "space-around",
-    marginBottom: 20,
-  },
-  emptyContainer: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 20,
-    paddingVertical: 60,
-  },
-  emptyText: {
-    color: "#fff",
-    fontSize: 20,
-    fontWeight: "bold",
-    marginBottom: 8,
-    textAlign: "center",
-  },
-  emptySubtext: {
-    color: "#999",
-    fontSize: 16,
-    textAlign: "center",
-  },
-  loadingFooter: {
+  container: { flex: 1, backgroundColor: Palette.background },
+  centered: { flex: 1, justifyContent: "center" },
+  title: { paddingHorizontal: 0 },
+  row: { gap: Spacing.sm, marginBottom: Spacing.lg },
+  footer: {
     flexDirection: "row",
-    justifyContent: "center",
     alignItems: "center",
-    paddingVertical: 20,
-  },
-  loadingFooterText: {
-    color: "#999",
-    fontSize: 14,
-    marginLeft: 8,
-  },
-  loadingContainer: {
-    flex: 1,
-    backgroundColor: "#000",
     justifyContent: "center",
-    alignItems: "center",
-  },
-  loadingText: {
-    color: "#fff",
-    fontSize: 16,
-    marginTop: 16,
-  },
-  errorContainer: {
-    flex: 1,
-    backgroundColor: "#000",
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 20,
-  },
-  errorText: {
-    color: "#fff",
-    fontSize: 16,
-    textAlign: "center",
-    marginBottom: 20,
-  },
-  retryButton: {
-    backgroundColor: "#e50914",
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderRadius: 8,
-  },
-  retryButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
+    gap: Spacing.xs,
+    paddingVertical: Spacing.lg,
   },
 });

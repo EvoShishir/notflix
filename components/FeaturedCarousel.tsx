@@ -1,15 +1,66 @@
-import { VideoType } from "@/types";
-import { LinearGradient } from "expo-linear-gradient";
-import React, { useEffect, useRef, useState } from "react";
 import {
-  Dimensions,
-  FlatList,
-  Image,
-  Pressable,
+  Duration,
+  Easings,
+  Gradients,
+  IconSize,
+  Palette,
+  Radius,
+  Spacing,
+  TouchTarget,
+} from "@/constants/theme";
+import { VideoType } from "@/types";
+import Ionicons from "@expo/vector-icons/Ionicons";
+import { Image } from "expo-image";
+import { LinearGradient } from "expo-linear-gradient";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
   StyleSheet,
-  Text,
+  useWindowDimensions,
   View,
+  ViewToken,
 } from "react-native";
+import Animated, {
+  cancelAnimation,
+  Extrapolation,
+  interpolate,
+  SharedValue,
+  useAnimatedScrollHandler,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { AppText } from "./ui/AppText";
+import { GhostButton, IconButton, PrimaryButton } from "./ui/Buttons";
+import { useMotionEnabled } from "./ui/Motion";
+
+const AUTOPLAY_MS = 6000;
+
+/** Module-level: closes over nothing, and must never change identity. */
+const VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 60 };
+
+/**
+ * Parallax geometry.
+ *
+ * The backdrop drifts by `PARALLAX_SHIFT` of the slide width in each direction,
+ * so it must be pre-scaled by at least 1 + 2 x that much or the drift pulls the
+ * image edge into view. `COVER_SCALE` carries a little extra margin on top.
+ *
+ * The scale is constant, not interpolated: animating it as well made the artwork
+ * visibly breathe on every swipe.
+ */
+const PARALLAX_SHIFT = 0.18;
+const COVER_SCALE = 1 + 2 * PARALLAX_SHIFT + 0.04;
+
+/**
+ * Hero height: tall on big phones, floored on small ones, capped in landscape.
+ * Exported so the loading skeleton reserves exactly this much space and the
+ * layout doesn't jump when the real carousel replaces it.
+ */
+export function useHeroHeight() {
+  const { height } = useWindowDimensions();
+  return Math.round(Math.min(Math.max(height * 0.62, 380), height - 120));
+}
 
 interface FeaturedCarouselProps {
   videos: VideoType[];
@@ -17,259 +68,397 @@ interface FeaturedCarouselProps {
   onInfoPress: (video: VideoType) => void;
 }
 
-const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One hero slide.
+ *
+ * The backdrop drifts at roughly a third of the scroll speed while the text
+ * block moves at full speed, which reads as depth. Both are derived from the
+ * same scroll offset, so there's no second animation to fall out of sync.
+ */
+function Slide({
+  video,
+  index,
+  scrollX,
+  width,
+  height,
+  parallax,
+  onPlayPress,
+  onInfoPress,
+}: {
+  video: VideoType;
+  index: number;
+  scrollX: SharedValue<number>;
+  width: number;
+  height: number;
+  parallax: boolean;
+  onPlayPress: (video: VideoType) => void;
+  onInfoPress: (video: VideoType) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const range = [(index - 1) * width, index * width, (index + 1) * width];
+
+  const backdropStyle = useAnimatedStyle(() => {
+    if (!parallax) return {};
+    return {
+      transform: [
+        {
+          translateX: interpolate(
+            scrollX.value,
+            range,
+            [-width * PARALLAX_SHIFT, 0, width * PARALLAX_SHIFT],
+            Extrapolation.CLAMP
+          ),
+        },
+        { scale: COVER_SCALE },
+      ],
+    };
+  });
+
+  const contentStyle = useAnimatedStyle(() => {
+    if (!parallax) return {};
+    return {
+      opacity: interpolate(
+        scrollX.value,
+        range,
+        [0, 1, 0],
+        Extrapolation.CLAMP
+      ),
+      transform: [
+        {
+          translateY: interpolate(
+            scrollX.value,
+            range,
+            [28, 0, 28],
+            Extrapolation.CLAMP
+          ),
+        },
+      ],
+    };
+  });
+
+  const meta =
+    video.type === "movie"
+      ? video.watchTime || `${video.duration}m`
+      : `${video.totalEpisodes} episodes`;
+
+  return (
+    // `overflow: hidden` is what makes the swipe seamless: without it the
+    // scaled, drifting backdrop spills past the slide and overlaps the artwork
+    // of the neighbouring slide mid-gesture.
+    <View style={{ width, height, overflow: "hidden" }}>
+      <Animated.View style={[StyleSheet.absoluteFill, backdropStyle]}>
+        <Image
+          source={{ uri: video.backdrop }}
+          style={StyleSheet.absoluteFill}
+          contentFit="cover"
+          transition={Duration.slow}
+          cachePolicy="memory-disk"
+          recyclingKey={video.id}
+        />
+      </Animated.View>
+
+      <LinearGradient colors={Gradients.heroScrim} style={styles.scrim} />
+
+      <Animated.View
+        style={[
+          styles.content,
+          { paddingTop: insets.top + Spacing.xxl },
+          contentStyle,
+        ]}
+      >
+        <AppText variant="label" tone="accent">
+          {video.type === "tv" ? "Series" : "Film"}
+        </AppText>
+
+        <AppText variant="hero" numberOfLines={2} style={styles.title}>
+          {video.title}
+        </AppText>
+
+        {/* One accessibility node so the metadata reads as a sentence. */}
+        <View
+          style={styles.metadata}
+          accessible
+          accessibilityLabel={`${video.releaseYear}, rated ${video.rating.toFixed(
+            1
+          )} out of 10, ${meta}`}
+        >
+          <AppText variant="small" tone="muted">
+            {video.releaseYear}
+          </AppText>
+          <View style={styles.dot} />
+          <View style={styles.rating}>
+            <Ionicons
+              name="star"
+              size={IconSize.sm - 3}
+              color={Palette.star}
+              accessibilityElementsHidden
+              importantForAccessibility="no"
+            />
+            <AppText variant="small" style={{ color: Palette.star }}>
+              {video.rating.toFixed(1)}
+            </AppText>
+          </View>
+          <View style={styles.dot} />
+          <AppText variant="small" tone="muted">
+            {meta}
+          </AppText>
+        </View>
+
+        {video.genres?.length > 0 && (
+          <AppText variant="small" tone="muted" numberOfLines={1}>
+            {video.genres.join("  ·  ")}
+          </AppText>
+        )}
+
+        <View style={styles.buttons}>
+          <PrimaryButton
+            label="Play"
+            icon="play"
+            onPress={() => onPlayPress(video)}
+            accessibilityLabel={`Play ${video.title}`}
+          />
+          <GhostButton
+            label="More info"
+            icon="information-circle-outline"
+            onPress={() => onInfoPress(video)}
+            accessibilityLabel={`More information about ${video.title}`}
+          />
+        </View>
+      </Animated.View>
+    </View>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+
+/** Pagination pill. The active one stretches and fills as autoplay progresses. */
+function Pill({
+  active,
+  progress,
+  animate,
+}: {
+  active: boolean;
+  progress: SharedValue<number>;
+  animate: boolean;
+}) {
+  const shellStyle = useAnimatedStyle(() => ({
+    width: withTiming(active ? 26 : 7, {
+      duration: Duration.base,
+      easing: Easings.out,
+    }),
+    backgroundColor: withTiming(
+      active ? Palette.borderStrong : Palette.border,
+      { duration: Duration.base }
+    ),
+  }));
+
+  const fillStyle = useAnimatedStyle(() => ({
+    width: active && animate ? `${progress.value * 100}%` : active ? "100%" : "0%",
+  }));
+
+  return (
+    <Animated.View style={[styles.pill, shellStyle]}>
+      <Animated.View style={[styles.pillFill, fillStyle]} />
+    </Animated.View>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 
 export default function FeaturedCarousel({
   videos,
   onPlayPress,
   onInfoPress,
 }: FeaturedCarouselProps) {
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const flatListRef = useRef<FlatList>(null);
+  const { width } = useWindowDimensions();
+  const motion = useMotionEnabled();
+  const listRef = useRef<Animated.FlatList<VideoType>>(null);
 
-  // Auto-scroll functionality
-  useEffect(() => {
-    if (videos.length <= 1) return;
+  const [index, setIndex] = useState(0);
+  /**
+   * Auto-advance is opt-out, and Reduce Motion opts out for you. WCAG requires a
+   * way to stop anything that moves on its own for more than five seconds, hence
+   * the visible pause control rather than relying on scroll-to-interrupt alone.
+   */
+  const [playing, setPlaying] = useState(true);
 
-    const interval = setInterval(() => {
-      setCurrentIndex((prevIndex) => {
-        const nextIndex = (prevIndex + 1) % videos.length;
-        flatListRef.current?.scrollToIndex({
-          index: nextIndex,
-          animated: true,
-        });
-        return nextIndex;
-      });
-    }, 5000); // Change slide every 5 seconds
+  const scrollX = useSharedValue(0);
+  const progress = useSharedValue(0);
 
-    return () => clearInterval(interval);
-  }, [videos.length]);
+  const autoplayOn = motion && playing && videos.length > 1;
 
-  const onViewableItemsChanged = useRef(({ viewableItems }: any) => {
-    if (viewableItems.length > 0) {
-      setCurrentIndex(viewableItems[0].index);
-    }
-  }).current;
+  const height = useHeroHeight();
 
-  const viewabilityConfig = useRef({
-    itemVisiblePercentThreshold: 50,
-  }).current;
+  const scrollHandler = useAnimatedScrollHandler((e) => {
+    scrollX.value = e.contentOffset.x;
+  });
 
-  const renderCarouselItem = ({ item: video }: { item: VideoType }) => (
-    <View style={styles.carouselItem}>
-      <Image
-        source={{ uri: video.backdrop }}
-        style={styles.backdrop}
-        resizeMode="cover"
-      />
-      <LinearGradient
-        colors={["transparent", "rgba(0,0,0,0.3)", "rgba(0,0,0,0.8)"]}
-        style={styles.gradient}
-      >
-        <View style={styles.content}>
-          <Text style={styles.title}>{video.title}</Text>
-          <Text style={styles.description} numberOfLines={3}>
-            {video.description}
-          </Text>
-          <View style={styles.metadata}>
-            <Text style={styles.year}>{video.releaseYear}</Text>
-            <Text style={styles.rating}>⭐ {video.rating.toFixed(1)}</Text>
-            <Text style={styles.duration}>
-              {video.type === "movie"
-                ? `${video.duration}m`
-                : `${video.totalEpisodes} Episodes`}
-            </Text>
-          </View>
-          <View style={styles.genres}>
-            {video.genres.map((genre, index) => (
-              <Text key={genre} style={styles.genre}>
-                {genre}
-                {index < video.genres.length - 1 ? " • " : ""}
-              </Text>
-            ))}
-          </View>
-          <View style={styles.buttons}>
-            <Pressable
-              style={[styles.button, styles.playButton]}
-              onPress={() => onPlayPress(video)}
-              android_ripple={{ color: "rgba(255, 255, 255, 0.2)" }}
-            >
-              <Text style={styles.playButtonText}>▶ Play</Text>
-            </Pressable>
-            <Pressable
-              style={[styles.button, styles.infoButton]}
-              onPress={() => onInfoPress(video)}
-              android_ripple={{ color: "rgba(255, 255, 255, 0.1)" }}
-            >
-              <Text style={styles.infoButtonText}>ℹ More Info</Text>
-            </Pressable>
-          </View>
-        </View>
-      </LinearGradient>
-    </View>
+  /**
+   * FlatList refuses a `onViewableItemsChanged` or `viewabilityConfig` whose
+   * identity changes between renders, so both have to be stable. `useCallback`
+   * with no dependencies gives that without reading a ref during render —
+   * `setIndex` is itself stable, so there is nothing to depend on.
+   */
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      const first = viewableItems[0];
+      if (first?.index != null) setIndex(first.index);
+    },
+    []
   );
 
-  const renderPaginationDots = () => {
-    if (videos.length <= 1) return null;
+  // Drive the pill fill, then advance when it completes.
+  useEffect(() => {
+    cancelAnimation(progress);
+    progress.value = 0;
 
-    return (
-      <View style={styles.paginationContainer}>
-        {videos.map((_, index) => (
-          <View
-            key={index}
-            style={[
-              styles.paginationDot,
-              index === currentIndex && styles.paginationDotActive,
-            ]}
-          />
-        ))}
-      </View>
-    );
-  };
+    if (!autoplayOn) return;
 
-  if (videos.length === 0) {
-    return null;
-  }
+    progress.value = withTiming(1, {
+      duration: AUTOPLAY_MS,
+      easing: Easings.linear,
+    });
+
+    const timer = setTimeout(() => {
+      const next = (index + 1) % videos.length;
+      listRef.current?.scrollToIndex({ index: next, animated: true });
+    }, AUTOPLAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [autoplayOn, index, videos.length, progress]);
+
+  const renderItem = useCallback(
+    ({ item, index: i }: { item: VideoType; index: number }) => (
+      <Slide
+        video={item}
+        index={i}
+        scrollX={scrollX}
+        width={width}
+        height={height}
+        parallax={motion}
+        onPlayPress={onPlayPress}
+        onInfoPress={onInfoPress}
+      />
+    ),
+    [scrollX, width, height, motion, onPlayPress, onInfoPress]
+  );
+
+  if (videos.length === 0) return null;
 
   return (
-    <View style={styles.container}>
-      <FlatList
-        ref={flatListRef}
+    <View style={{ height }}>
+      <Animated.FlatList
+        ref={listRef}
         data={videos}
-        renderItem={renderCarouselItem}
+        renderItem={renderItem}
         keyExtractor={(item) => item.id}
         horizontal
         pagingEnabled
         showsHorizontalScrollIndicator={false}
+        onScroll={scrollHandler}
+        scrollEventThrottle={16}
         onViewableItemsChanged={onViewableItemsChanged}
-        viewabilityConfig={viewabilityConfig}
-        getItemLayout={(_, index) => ({
-          length: screenWidth,
-          offset: screenWidth * index,
-          index,
+        viewabilityConfig={VIEWABILITY_CONFIG}
+        // Taking manual control stops the carousel advancing under the user.
+        onScrollBeginDrag={() => setPlaying(false)}
+        getItemLayout={(_, i) => ({
+          length: width,
+          offset: width * i,
+          index: i,
         })}
-        snapToInterval={screenWidth}
-        snapToAlignment="start"
         decelerationRate="fast"
+        // Horizontal swipes belong to the carousel; the page still scrolls
+        // vertically and the OS back-swipe is untouched.
+        directionalLockEnabled
+        // The featured set is small, so keep every slide mounted. Recycling them
+        // makes each backdrop re-run its fade-in as you swipe back and forth.
+        removeClippedSubviews={false}
+        initialNumToRender={videos.length}
+        windowSize={Math.max(3, videos.length)}
       />
-      {renderPaginationDots()}
+
+      {videos.length > 1 && (
+        <View style={styles.controls} pointerEvents="box-none">
+          <View
+            style={styles.pills}
+            accessible
+            accessibilityRole="adjustable"
+            accessibilityLabel={`Featured item ${index + 1} of ${videos.length}`}
+          >
+            {videos.map((video, i) => (
+              <Pill
+                key={video.id}
+                active={i === index}
+                progress={progress}
+                animate={autoplayOn}
+              />
+            ))}
+          </View>
+
+          {motion && (
+            <IconButton
+              name={playing ? "pause" : "play"}
+              label={
+                playing
+                  ? "Pause automatic slideshow"
+                  : "Resume automatic slideshow"
+              }
+              size={IconSize.sm}
+              onPress={() => setPlaying((p) => !p)}
+              style={styles.playPause}
+            />
+          )}
+        </View>
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    position: "relative",
-  },
-  carouselItem: {
-    width: screenWidth,
-    height: screenHeight > 800 ? 450 : 400,
-    position: "relative",
-  },
-  backdrop: {
-    width: "100%",
-    height: "100%",
-  },
-  gradient: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    justifyContent: "flex-end",
-  },
+  scrim: { ...StyleSheet.absoluteFill, justifyContent: "flex-end" },
   content: {
-    padding: 16,
-    paddingBottom: 32,
+    ...StyleSheet.absoluteFill,
+    justifyContent: "flex-end",
+    paddingHorizontal: Spacing.md,
+    paddingBottom: Spacing.xxl + Spacing.xs,
+    gap: Spacing.xs,
   },
-  title: {
-    color: "#fff",
-    fontSize: 28,
-    fontWeight: "bold",
-    marginBottom: 8,
+  title: { marginTop: Spacing.xxs },
+  metadata: { flexDirection: "row", alignItems: "center", gap: Spacing.xs },
+  dot: {
+    width: 3,
+    height: 3,
+    borderRadius: Radius.pill,
+    backgroundColor: Palette.subtleForeground,
   },
-  description: {
-    color: "#ccc",
-    fontSize: 14,
-    lineHeight: 20,
-    marginBottom: 12,
-  },
-  metadata: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 8,
-  },
-  year: {
-    color: "#ccc",
-    fontSize: 14,
-    marginRight: 16,
-  },
-  rating: {
-    color: "#ffd700",
-    fontSize: 14,
-    fontWeight: "600",
-    marginRight: 16,
-  },
-  duration: {
-    color: "#ccc",
-    fontSize: 14,
-  },
-  genres: {
-    flexDirection: "row",
-    marginBottom: 20,
-  },
-  genre: {
-    color: "#fff",
-    fontSize: 12,
-    fontWeight: "500",
-  },
+  rating: { flexDirection: "row", alignItems: "center", gap: Spacing.xxs },
   buttons: {
     flexDirection: "row",
-    gap: 12,
+    gap: Spacing.sm,
+    marginTop: Spacing.sm,
+    flexWrap: "wrap",
   },
-  button: {
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 4,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    minWidth: 120,
-  },
-  playButton: {
-    backgroundColor: "#fff",
-  },
-  playButtonText: {
-    color: "#000",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
-  infoButton: {
-    backgroundColor: "rgba(255, 255, 255, 0.2)",
-  },
-  infoButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "600",
-  },
-  paginationContainer: {
+  controls: {
     position: "absolute",
-    bottom: 20,
-    left: 0,
-    right: 0,
+    bottom: Spacing.md,
+    left: Spacing.md,
+    right: Spacing.md,
     flexDirection: "row",
-    justifyContent: "center",
     alignItems: "center",
-    gap: 8,
+    justifyContent: "space-between",
+    gap: Spacing.sm,
   },
-  paginationDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: "rgba(255, 255, 255, 0.3)",
+  pills: { flexDirection: "row", alignItems: "center", gap: Spacing.xxs + 2 },
+  pill: {
+    height: 7,
+    borderRadius: Radius.pill,
+    overflow: "hidden",
   },
-  paginationDotActive: {
-    backgroundColor: "#e50914",
-    width: 24,
+  pillFill: { height: "100%", backgroundColor: Palette.accent },
+  playPause: {
+    width: TouchTarget,
+    height: TouchTarget,
   },
 });

@@ -1,16 +1,34 @@
+import { AppText } from "@/components/ui/AppText";
+import { useMotion } from "@/components/ui/Motion";
+import { PressableScale } from "@/components/ui/PressableScale";
+import {
+  LargeTitle,
+  StickyHeaderBar,
+  useStickyHeaderHeight,
+} from "@/components/ui/ScreenHeader";
+import { Skeleton, SkeletonGroup } from "@/components/ui/Skeleton";
+import { EmptyState, ErrorState } from "@/components/ui/StateViews";
+import {
+  gutterFor,
+  IconSize,
+  Palette,
+  Radius,
+  Spacing,
+  TouchTarget,
+} from "@/constants/theme";
 import { apiService } from "@/services/api";
 import { CategoryAPIItem } from "@/types";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useCallback, useEffect, useState } from "react";
-import {
-  ActivityIndicator,
-  FlatList,
-  Pressable,
-  StatusBar,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { StyleSheet, useWindowDimensions, View } from "react-native";
+import Animated, {
+  useAnimatedScrollHandler,
+  useSharedValue,
+} from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+const ROW_HEIGHT = TouchTarget + Spacing.lg;
 
 export default function CategoryDetailScreen() {
   const { id, name, hasSubCategories } = useLocalSearchParams<{
@@ -19,248 +37,186 @@ export default function CategoryDetailScreen() {
     hasSubCategories: string;
   }>();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const { enter } = useMotion();
+  const headerHeight = useStickyHeaderHeight();
+  const gutter = gutterFor(width);
+  const scrollY = useSharedValue(0);
+
+  const isLeaf = hasSubCategories !== "true";
 
   const [subCategories, setSubCategories] = useState<CategoryAPIItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!isLeaf);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (hasSubCategories === "true") {
-      fetchSubCategories();
-    } else {
-      setLoading(false);
-    }
-  }, [id, hasSubCategories]);
+  const scrollHandler = useAnimatedScrollHandler((e) => {
+    scrollY.value = e.contentOffset.y;
+  });
 
-  const fetchSubCategories = async () => {
+  const fetchSubCategories = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const allCategories = await apiService.fetchCategories();
-
-      // Find the main category and get its sub-categories
-      const mainCategory = allCategories.find(
-        (cat) => cat.id.toString() === id
-      );
-      if (mainCategory && mainCategory.subCategory) {
-        setSubCategories(mainCategory.subCategory);
-      }
-    } catch (error) {
-      console.error("Error fetching sub-categories:", error);
-      setError("Failed to load sub-categories. Please try again.");
+      const all = await apiService.fetchCategories();
+      const parent = all.find((cat) => cat.id.toString() === id);
+      setSubCategories(parent?.subCategory ?? []);
+    } catch {
+      setError("We couldn't load this category's sections.");
     } finally {
       setLoading(false);
     }
-  };
+  }, [id]);
 
-  const handleSubCategoryPress = useCallback(
-    (subCategory: CategoryAPIItem) => {
-      // Navigate to category content (videos)
+  /**
+   * One effect, always run in the same order — a leaf category has no sections
+   * to show, so it forwards straight to the content screen instead of rendering
+   * an empty list. (Previously this branch called `useEffect` after an early
+   * return, which changed hook order between renders.)
+   */
+  useEffect(() => {
+    if (isLeaf) {
+      router.replace({
+        pathname: "/category-content/[id]",
+        params: { id, name },
+      });
+      return;
+    }
+    fetchSubCategories();
+  }, [isLeaf, id, name, router, fetchSubCategories]);
+
+  const handlePress = useCallback(
+    (sub: CategoryAPIItem) => {
       router.push({
         pathname: "/category-content/[id]",
-        params: {
-          id: subCategory.id.toString(),
-          name: subCategory.name,
-        },
+        params: { id: sub.id.toString(), name: sub.name },
       });
     },
     [router]
   );
 
-  const renderSubCategoryItem = useCallback(
-    ({ item }: { item: CategoryAPIItem }) => (
-      <Pressable
-        style={styles.subCategoryItem}
-        onPress={() => handleSubCategoryPress(item)}
-        android_ripple={{ color: "rgba(255, 255, 255, 0.1)" }}
-      >
-        <Text style={styles.subCategoryName}>{item.name}</Text>
-        <Text style={styles.arrow}>›</Text>
-      </Pressable>
+  const renderItem = useCallback(
+    ({ item, index }: { item: CategoryAPIItem; index: number }) => (
+      <Animated.View entering={enter.rise(index, 45)}>
+        <PressableScale
+          onPress={() => handlePress(item)}
+          accessibilityRole="button"
+          accessibilityLabel={item.name}
+          accessibilityHint="Opens titles in this section"
+          scaleTo={0.985}
+          style={styles.row}
+        >
+          <AppText variant="body" numberOfLines={2} style={styles.rowLabel}>
+            {item.name}
+          </AppText>
+          <Ionicons
+            name="chevron-forward"
+            size={IconSize.md}
+            color={Palette.mutedForeground}
+            accessibilityElementsHidden
+            importantForAccessibility="no"
+          />
+        </PressableScale>
+      </Animated.View>
     ),
-    [handleSubCategoryPress]
+    [enter, handlePress]
   );
 
-  if (loading) {
+  if (isLeaf || loading) {
     return (
-      <View style={styles.loadingContainer}>
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
-        <ActivityIndicator size="large" color="#e50914" />
-        <Text style={styles.loadingText}>Loading...</Text>
+      <View style={styles.container}>
+        <StickyHeaderBar title={name ?? "Category"} scrollY={scrollY} />
+        <SkeletonGroup label="Loading sections">
+          <View style={{ paddingHorizontal: gutter, paddingTop: headerHeight + Spacing.md }}>
+            <Skeleton width={220} height={30} />
+            {Array.from({ length: 7 }).map((_, i) => (
+              <Skeleton
+                key={i}
+                height={ROW_HEIGHT}
+                radius={Radius.lg}
+                style={{ marginTop: Spacing.xs }}
+              />
+            ))}
+          </View>
+        </SkeletonGroup>
       </View>
     );
   }
 
   if (error) {
     return (
-      <View style={styles.errorContainer}>
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
-        <Text style={styles.errorText}>{error}</Text>
-        <Pressable style={styles.retryButton} onPress={fetchSubCategories}>
-          <Text style={styles.retryButtonText}>Retry</Text>
-        </Pressable>
-      </View>
-    );
-  }
-
-  if (hasSubCategories === "false") {
-    // This is a leaf category, redirect to content screen
-    React.useEffect(() => {
-      router.replace({
-        pathname: "/category-content/[id]",
-        params: {
-          id: id,
-          name: name,
-        },
-      });
-    }, [id, name, router]);
-
-    return (
-      <View style={styles.loadingContainer}>
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
-        <ActivityIndicator size="large" color="#e50914" />
-        <Text style={styles.loadingText}>Loading content...</Text>
+      <View style={styles.container}>
+        <StickyHeaderBar title={name ?? "Category"} scrollY={scrollY} />
+        <View style={styles.centered}>
+          <ErrorState
+            title="Couldn't open this category"
+            message={error}
+            onRetry={fetchSubCategories}
+          />
+        </View>
       </View>
     );
   }
 
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000" />
+      <StickyHeaderBar title={name ?? "Category"} scrollY={scrollY} />
 
-      <View style={styles.header}>
-        <Pressable style={styles.backButton} onPress={() => router.back()}>
-          <Text style={styles.backButtonText}>‹</Text>
-        </Pressable>
-        <Text style={styles.headerTitle}>{name}</Text>
-        <Text style={styles.headerSubtitle}>
-          Choose a sub-category to browse content
-        </Text>
-      </View>
-
-      <FlatList
+      <Animated.FlatList
         data={subCategories}
-        renderItem={renderSubCategoryItem}
+        renderItem={renderItem}
         keyExtractor={(item) => item.id.toString()}
+        onScroll={scrollHandler}
+        scrollEventThrottle={16}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.listContent}
-        initialNumToRender={10}
+        ListHeaderComponent={
+          <LargeTitle
+            eyebrow="Category"
+            title={name ?? "Category"}
+            subtitle={`${subCategories.length} section${
+              subCategories.length === 1 ? "" : "s"
+            }`}
+            offset={headerHeight}
+            style={styles.title}
+          />
+        }
+        ListEmptyComponent={
+          <EmptyState
+            icon="folder-open-outline"
+            title="No sections here"
+            message="This category has no sub-sections to browse."
+          />
+        }
+        contentContainerStyle={{
+          paddingHorizontal: gutter,
+          paddingBottom: insets.bottom + Spacing.xxl,
+        }}
+        initialNumToRender={12}
         maxToRenderPerBatch={10}
-        windowSize={10}
-        removeClippedSubviews={true}
-        getItemLayout={(data, index) => ({
-          length: 60, // Approximate height of sub-category item
-          offset: 60 * index,
-          index,
-        })}
+        windowSize={9}
+        removeClippedSubviews
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#000",
-  },
-  header: {
-    paddingHorizontal: 16,
-    paddingTop: 60,
-    paddingBottom: 20,
-  },
-  backButton: {
-    marginBottom: 16,
-  },
-  backButtonText: {
-    color: "#e50914",
-    fontSize: 24,
-    fontWeight: "bold",
-  },
-  headerTitle: {
-    color: "#fff",
-    fontSize: 24,
-    fontWeight: "bold",
-    marginBottom: 4,
-  },
-  headerSubtitle: {
-    color: "#999",
-    fontSize: 14,
-  },
-  listContent: {
-    paddingHorizontal: 16,
-    paddingBottom: 100,
-  },
-  subCategoryItem: {
-    backgroundColor: "#1a1a1a",
-    borderRadius: 8,
-    marginBottom: 8,
-    padding: 16,
+  container: { flex: 1, backgroundColor: Palette.background },
+  centered: { flex: 1, justifyContent: "center" },
+  title: { paddingHorizontal: 0 },
+  row: {
+    minHeight: ROW_HEIGHT,
     flexDirection: "row",
+    alignItems: "center",
     justifyContent: "space-between",
-    alignItems: "center",
+    gap: Spacing.sm,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+    marginBottom: Spacing.xs,
+    borderRadius: Radius.lg,
+    backgroundColor: Palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: Palette.border,
   },
-  subCategoryName: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "500",
-    flex: 1,
-  },
-  arrow: {
-    color: "#e50914",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
-  comingSoonContainer: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 20,
-  },
-  comingSoonText: {
-    color: "#fff",
-    fontSize: 20,
-    fontWeight: "bold",
-    marginBottom: 8,
-    textAlign: "center",
-  },
-  comingSoonSubtext: {
-    color: "#999",
-    fontSize: 16,
-    textAlign: "center",
-  },
-  loadingContainer: {
-    flex: 1,
-    backgroundColor: "#000",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  loadingText: {
-    color: "#fff",
-    fontSize: 16,
-    marginTop: 16,
-  },
-  errorContainer: {
-    flex: 1,
-    backgroundColor: "#000",
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 20,
-  },
-  errorText: {
-    color: "#fff",
-    fontSize: 16,
-    textAlign: "center",
-    marginBottom: 20,
-  },
-  retryButton: {
-    backgroundColor: "#e50914",
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderRadius: 8,
-  },
-  retryButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
+  rowLabel: { flex: 1 },
 });
