@@ -44,3 +44,6 @@ app-example
 # app.json no longer drives the build on its own.
 /android
 /ios
+
+# Gradle output from local Expo modules
+modules/*/android/build/
