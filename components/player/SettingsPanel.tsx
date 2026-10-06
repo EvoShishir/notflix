@@ -30,9 +30,27 @@ import Animated, {
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useScreenHeight } from "@/hooks/useScreenHeight";
+import {
+  type AudioOutput,
+  setPlayerPrefs,
+  useAudioOutput,
+} from "@/lib/playerPrefs";
 import { ExternalSubtitles } from "./ExternalSubtitles";
 import { DropdownOption, OptionDropdown } from "./OptionDropdown";
 import { SubtitleStyleSection } from "./SubtitleStyleSection";
+
+/**
+ * libVLC's two Android audio outputs. AudioTrack is its default; OpenSL ES is
+ * the fallback VLC's own app offers when audio starts late or stutters.
+ */
+const AUDIO_OUTPUTS: DropdownOption[] = [
+  { key: "audiotrack", label: "AudioTrack", sublabel: "Default" },
+  {
+    key: "opensles",
+    label: "OpenSL ES",
+    sublabel: "Try this if audio starts late or stutters",
+  },
+];
 
 /** libVLC uses -1 to mean "no subtitle track". */
 const SUBTITLES_OFF = -1;
@@ -98,6 +116,7 @@ export function SettingsPanel({
 }: SettingsPanelProps) {
   const insets = useSafeAreaInsets();
   const screenHeight = useScreenHeight();
+  const audioOutput = useAudioOutput();
   const motion = useMotionEnabled();
   const { width } = useWindowDimensions();
 
@@ -222,6 +241,21 @@ export function SettingsPanel({
               expanded={openGroup === "audio"}
               onToggle={() => toggleGroup("audio")}
               emptyMessage="This video has a single audio track."
+            />
+            <OptionDropdown
+              title="Audio output"
+              valueLabel={
+                AUDIO_OUTPUTS.find((o) => o.key === audioOutput)?.label ??
+                "AudioTrack"
+              }
+              options={AUDIO_OUTPUTS}
+              selectedKey={audioOutput}
+              // Applied by the player, which rebuilds at the same position.
+              onSelect={(key) =>
+                setPlayerPrefs({ audioOutput: key as AudioOutput })
+              }
+              expanded={openGroup === "output"}
+              onToggle={() => toggleGroup("output")}
             />
 
             <AppText variant="label" tone="muted" style={styles.sectionLabel}>

@@ -23,7 +23,7 @@ import { useMotionEnabled } from "@/components/ui/Motion";
 import { Duration, FontFamily, Palette } from "@/constants/theme";
 import { DataProvider } from "@/contexts/DataContext";
 import { hydrateDownloads } from "@/lib/downloads";
-import { hydratePlayerLevels } from "@/lib/playerLevels";
+import { hydratePlayerPrefs } from "@/lib/playerPrefs";
 import { hydrateSubtitleStyle } from "@/lib/subtitleStyle";
 import { hydrateSubtitlePrefs } from "@/lib/subtitles";
 import { hydrateWatchProgress } from "@/lib/watchProgress";
@@ -86,7 +86,7 @@ export default function RootLayout() {
     void hydrateDownloads();
     void hydrateSubtitlePrefs();
     void hydrateSubtitleStyle();
-    void hydratePlayerLevels();
+    void hydratePlayerPrefs();
   }, []);
 
   useEffect(() => {

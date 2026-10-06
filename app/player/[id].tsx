@@ -21,8 +21,18 @@ import {
   subtitleInitOptions,
   useSubtitleStyle,
 } from "@/lib/subtitleStyle";
-import { getPlayerLevels, setPlayerLevels } from "@/lib/playerLevels";
+import {
+  audioOutputInitOptions,
+  getPlayerPrefs,
+  setPlayerPrefs,
+  useAudioOutput,
+} from "@/lib/playerPrefs";
 import { getResumePosition, recordProgress } from "@/lib/watchProgress";
+import {
+  getSystemVolume,
+  setSystemVolume,
+  systemVolumeAvailable,
+} from "@/modules/system-volume";
 import { apiService } from "@/services/api";
 import { Episode, TVShow, Video } from "@/types";
 // The view is the package's default export; the types are named.
@@ -230,6 +240,7 @@ export default function VideoPlayerScreen() {
    */
   const [session, setSession] = useState(() => ({
     style: getSubtitleStyle(),
+    audioOutput: getPlayerPrefs().audioOutput,
     /**
      * Where the stream opens, in seconds. Passed as libVLC's `:start-time`
      * rather than seeking after load: a seek issued while the stream is still
@@ -239,11 +250,48 @@ export default function VideoPlayerScreen() {
     startAt: 0,
   }));
 
-  /** Player volume, 0–200, carried over from the last viewing. */
-  const [volume, setVolume] = useState(() => getPlayerLevels().volume);
+  /**
+   * libVLC's own volume, 0–200 (100 is unity), carried over from the last
+   * viewing. With the system-volume module it is only ever the boost above a
+   * maxed-out phone, so it never drops below 100; without it (iOS, older
+   * builds) it covers the whole range as before.
+   */
+  const [volume, setVolume] = useState(() =>
+    systemVolumeAvailable
+      ? Math.max(100, getPlayerPrefs().volume)
+      : getPlayerPrefs().volume
+  );
+
+  /**
+   * What the volume swipe shows and moves, 0–200: the phone's media volume up
+   * to 100, then libVLC's boost. The phone goes up first, so the boost only
+   * starts once the phone itself is at full volume.
+   */
+  const readVolumeLevel = useCallback(() => {
+    if (!systemVolumeAvailable) return volume;
+    const phone = getSystemVolume();
+    return phone < 0.999 ? Math.round(phone * 100) : volume;
+  }, [volume]);
+
+  const [volumeLevel, setVolumeLevel] = useState(readVolumeLevel);
+
+  const syncVolumeLevel = useCallback(
+    () => setVolumeLevel(readVolumeLevel()),
+    [readVolumeLevel]
+  );
+
   const handleVolumeChange = useCallback((next: number) => {
-    setVolume(next);
-    setPlayerLevels({ volume: next });
+    setVolumeLevel(next);
+    if (!systemVolumeAvailable) {
+      setVolume(next);
+      setPlayerPrefs({ volume: next });
+      return;
+    }
+    // Set without the system volume panel, which would cover the player.
+    setSystemVolume(Math.min(next, 100) / 100);
+    const boost = Math.max(next, 100);
+    setVolume(boost);
+    setPlayerPrefs({ volume: boost });
   }, []);
   /**
    * Bumped to re-send `volume` to a rebuilt player. The prop is a double that
@@ -259,7 +307,10 @@ export default function VideoPlayerScreen() {
             uri: sourceUri,
             autoplay: true,
             isNetwork: !sourceUri.startsWith("file:"),
-            initOptions: subtitleInitOptions(session.style),
+            initOptions: [
+              ...subtitleInitOptions(session.style),
+              ...audioOutputInitOptions(session.audioOutput),
+            ],
             mediaOptions:
               session.startAt > 0
                 ? [`:start-time=${session.startAt.toFixed(2)}`]
@@ -485,16 +536,23 @@ export default function VideoPlayerScreen() {
   }, [video, subPref.offset, refreshTracks]);
 
   /**
-   * Apply a changed subtitle style live, shortly after the last tap.
+   * Apply a changed subtitle style or audio output live, shortly after the
+   * last tap.
    *
-   * libVLC only reads text-render options when an instance is built, so a new
-   * style means rebuilding the player at the same position — a brief rebuffer.
-   * Waiting for a quiet moment folds a run of taps into one rebuild.
+   * libVLC only reads these when an instance is built, so a change means
+   * rebuilding the player at the same position — a brief rebuffer. Waiting for
+   * a quiet moment folds a run of taps into one rebuild.
    */
   const liveStyle = useSubtitleStyle();
+  const liveAudioOutput = useAudioOutput();
 
   useEffect(() => {
-    if (sameSubtitleStyle(liveStyle, session.style)) return;
+    if (
+      sameSubtitleStyle(liveStyle, session.style) &&
+      liveAudioOutput === session.audioOutput
+    ) {
+      return;
+    }
     const timer = setTimeout(() => {
       // The library's paused flag survives into the rebuilt player and stops
       // it from autoplaying — which never fires the open event, so the spinner
@@ -503,10 +561,21 @@ export default function VideoPlayerScreen() {
       reloadPaused.current = !playing;
       setPlaying(true);
       setBuffering(true);
-      setSession({ style: getSubtitleStyle(), startAt: currentPosition() });
+      setSession({
+        style: getSubtitleStyle(),
+        audioOutput: getPlayerPrefs().audioOutput,
+        startAt: currentPosition(),
+      });
     }, STYLE_APPLY_DELAY_MS);
     return () => clearTimeout(timer);
-  }, [liveStyle, session.style, playing, currentPosition]);
+  }, [
+    liveStyle,
+    liveAudioOutput,
+    session.style,
+    session.audioOutput,
+    playing,
+    currentPosition,
+  ]);
 
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
@@ -895,8 +964,9 @@ export default function VideoPlayerScreen() {
       <PlayerGestures
         duration={duration}
         progress={progress}
-        volume={volume}
+        volume={volumeLevel}
         onVolumeChange={handleVolumeChange}
+        onVolumeTouch={syncVolumeLevel}
         onSeekBy={gestureSeekBy}
         onSeekTo={gestureSeekTo}
         onSingleTap={toggleControls}

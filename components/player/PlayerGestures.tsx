@@ -18,7 +18,7 @@ import React, {
   useState,
 } from "react";
 import { Platform, StyleSheet, View } from "react-native";
-import { getPlayerLevels, setPlayerLevels } from "@/lib/playerLevels";
+import { getPlayerPrefs, setPlayerPrefs } from "@/lib/playerPrefs";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   runOnJS,
@@ -33,7 +33,10 @@ import { formatTime } from "./SeekBar";
 export const SEEK_STEP = 10;
 /** Taps inside this window after a double tap keep adding to the same seek. */
 const CHAIN_MS = 800;
-/** Player volume tops out at 200% — libVLC's software boost. */
+/**
+ * The volume swipe's range: 0–100% is the phone's media volume, 100–200% is
+ * libVLC's software boost on top of a maxed-out phone.
+ */
 export const VOLUME_MAX = 200;
 /** Fraction of the screen height a swipe must cover to sweep the full range. */
 const SWIPE_SPAN = 0.75;
@@ -84,9 +87,14 @@ interface PlayerGesturesProps {
   duration: number;
   /** Playback position as a 0–1 fraction, shared with the seek bar. */
   progress: SharedValue<number>;
-  /** Player volume, 0–VOLUME_MAX (100 is unity). */
+  /** Combined volume, 0–VOLUME_MAX: phone volume up to 100, boost above. */
   volume: number;
   onVolumeChange: (volume: number) => void;
+  /**
+   * Called as a touch lands, so the volume can be re-read before a swipe
+   * starts from it — the hardware buttons may have moved it since.
+   */
+  onVolumeTouch?: () => void;
   /** Relative seek. Must not reveal the controls. */
   onSeekBy: (seconds: number) => void;
   /** Absolute seek. Must not reveal the controls. */
@@ -167,6 +175,7 @@ export function PlayerGestures({
   progress,
   volume,
   onVolumeChange,
+  onVolumeTouch,
   onSeekBy,
   onSeekTo,
   onSingleTap,
@@ -275,7 +284,7 @@ export function PlayerGestures({
   useEffect(() => {
     let active = true;
     let original: number | null = null;
-    const saved = getPlayerLevels().brightness;
+    const saved = getPlayerPrefs().brightness;
 
     // Read the current level first even when restoring a saved one: on iOS it
     // is the system level, and it has to be put back on the way out.
@@ -306,7 +315,7 @@ export function PlayerGestures({
   const applyBrightness = useCallback((value: number) => {
     setBrightnessPct(Math.round(value * 100));
     Brightness.setBrightnessAsync(value).catch(() => {});
-    setPlayerLevels({ brightness: value });
+    setPlayerPrefs({ brightness: value });
   }, []);
 
   /* -------------------------------- volume -------------------------------- */
@@ -362,6 +371,9 @@ export function PlayerGestures({
       .minDistance(14)
       .onBegin((e) => {
         startX.value = e.x;
+        if (onVolumeTouch && e.x > surfaceWidth.value * (1 - LEVEL_ZONE)) {
+          runOnJS(onVolumeTouch)();
+        }
       })
       .onStart(() => {
         // The activation event reports a translation of 0,0, so the direction
@@ -497,6 +509,7 @@ export function PlayerGestures({
     updateSeekPreview,
     applyBrightness,
     onVolumeChange,
+    onVolumeTouch,
     onSeekTo,
     handleDoubleTap,
     handleSingleTap,
@@ -592,7 +605,7 @@ export function PlayerGestures({
           icon={volumeIcon}
           label={`${volume}%`}
           level={volumeFill}
-          // 100% is unity gain; above it libVLC is amplifying.
+          // Above 100% the phone is at full volume and libVLC is amplifying.
           boost={100 / VOLUME_MAX}
           opacity={volumeOpacity}
         />
