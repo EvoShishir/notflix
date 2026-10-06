@@ -39,7 +39,6 @@
           "backgroundColor": "#ffffff"
         }
       ],
-      "expo-audio",
       [
         "expo-build-properties",
         {
@@ -49,8 +48,8 @@
         }
       ],
       "expo-font",
-      "expo-web-browser",
-      "expo-asset"
+      "expo-asset",
+      "./plugins/withQuietLibraryWarnings"
     ],
     "experiments": {
       "typedRoutes": true

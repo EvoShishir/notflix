@@ -99,6 +99,30 @@ export interface Cue {
 /*                              Per-title settings                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A remembered track choice.
+ *
+ * libVLC's ids come from the demuxer, so they are stable for the same file, but
+ * the name is kept too: a re-encoded or replaced file can number its streams
+ * differently, and "English 5.1" is a better match than a bare index.
+ */
+export interface TrackRef {
+  id: number;
+  name: string;
+}
+
+/** Find a remembered track in a fresh list: exact match, then name, then id. */
+export function matchTrack<T extends TrackRef>(
+  list: T[],
+  ref: TrackRef
+): T | undefined {
+  return (
+    list.find((t) => t.id === ref.id && t.name === ref.name) ??
+    (ref.name ? list.find((t) => t.name === ref.name) : undefined) ??
+    list.find((t) => t.id === ref.id)
+  );
+}
+
 export interface SubtitlePref {
   /** Seconds to shift the subtitles by. Positive = show later. */
   offset: number;
@@ -106,6 +130,10 @@ export interface SubtitlePref {
   fileUri?: string;
   /** The file's original name, shown in the settings panel. */
   label?: string;
+  /** Audio track chosen for this title. */
+  audioTrack?: TrackRef;
+  /** Embedded subtitle track chosen for this title; id -1 means off. */
+  subtitleTrack?: TrackRef;
 }
 
 type Prefs = Record<string, SubtitlePref>;

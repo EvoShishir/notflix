@@ -23,6 +23,7 @@ import { useMotionEnabled } from "@/components/ui/Motion";
 import { Duration, FontFamily, Palette } from "@/constants/theme";
 import { DataProvider } from "@/contexts/DataContext";
 import { hydrateDownloads } from "@/lib/downloads";
+import { hydratePlayerLevels } from "@/lib/playerLevels";
 import { hydrateSubtitleStyle } from "@/lib/subtitleStyle";
 import { hydrateSubtitlePrefs } from "@/lib/subtitles";
 import { hydrateWatchProgress } from "@/lib/watchProgress";
@@ -85,6 +86,7 @@ export default function RootLayout() {
     void hydrateDownloads();
     void hydrateSubtitlePrefs();
     void hydrateSubtitleStyle();
+    void hydratePlayerLevels();
   }, []);
 
   useEffect(() => {
@@ -138,6 +140,11 @@ export default function RootLayout() {
                   animationDuration: Duration.base,
                   // The player owns the whole screen; hide the OS bars with it.
                   autoHideHomeIndicator: true,
+                  // Horizontal drags are the player's scrub gesture. Left on,
+                  // the stack's swipe-back claimed them first, so swipe-seek
+                  // never started while vertical swipes worked. Close is
+                  // still the button and the back button/gesture.
+                  gestureEnabled: false,
                 }}
               />
               <Stack.Screen name="category/[id]" options={drillDown} />

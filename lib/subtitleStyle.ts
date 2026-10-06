@@ -6,7 +6,8 @@
  * knobs are *instance* options (`--freetype-*`, `--sub-margin`), which the
  * player library only reads when it builds a fresh LibVLC for a new `source`.
  * Changing the style therefore means reloading the stream; the player screen
- * handles that and seeks back.
+ * does that shortly after the last change and reopens at the same position.
+ * VLC's own Android app restarts playback for the same reason.
  *
  * One global preference, not per title: people pick a look once and expect it
  * everywhere.
@@ -59,6 +60,11 @@ const REL_FONT_SIZE: Record<SubtitleSize, number> = {
   large: 13,
   xlarge: 10,
 };
+
+/** The size divisor for a size choice, for previews. */
+export function subtitleRelFontSize(size: SubtitleSize) {
+  return REL_FONT_SIZE[size];
+}
 
 /** freetype colours are decimal RGB integers. */
 const COLOR: Record<SubtitleColor, number> = {

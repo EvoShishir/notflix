@@ -1,4 +1,4 @@
-import { DoubleTapSeek } from "@/components/player/DoubleTapSeek";
+import { PlayerGestures } from "@/components/player/PlayerGestures";
 import { SettingsPanel } from "@/components/player/SettingsPanel";
 import { VideoControls } from "@/components/player/VideoControls";
 import { AppText } from "@/components/ui/AppText";
@@ -9,7 +9,9 @@ import {
   getSubtitlePref,
   importSubtitleFile,
   isSubtitleFile,
+  matchTrack,
   setSubtitlePref,
+  type SubtitlePref,
   subtitleFileExists,
   useSubtitlePref,
 } from "@/lib/subtitles";
@@ -19,6 +21,7 @@ import {
   subtitleInitOptions,
   useSubtitleStyle,
 } from "@/lib/subtitleStyle";
+import { getPlayerLevels, setPlayerLevels } from "@/lib/playerLevels";
 import { getResumePosition, recordProgress } from "@/lib/watchProgress";
 import { apiService } from "@/services/api";
 import { Episode, TVShow, Video } from "@/types";
@@ -60,8 +63,13 @@ const TRACK_DISCOVERY_MS = 15_000;
 /** Track selection and sidecar loading are applied on libVLC's input thread. */
 const TRACK_SETTLE_MS = 2_000;
 /**
+ * How long after a seek to trust its target over reported progress. libVLC's
+ * position lags a seek briefly, and chained taps must build on the target.
+ */
+const SEEK_SETTLE_MS = 1_500;
+/**
  * Quiet period before a subtitle-style change is applied. Applying means
- * reloading the stream, so a burst of taps in the panel should cost one reload.
+ * reloading the stream, so a burst of taps in the panel costs one reload.
  */
 const STYLE_APPLY_DELAY_MS = 700;
 
@@ -127,22 +135,16 @@ export default function VideoPlayerScreen() {
 
   /** Latest playback position in seconds, for restoring after a reload. */
   const positionRef = useRef(0);
+  /** The most recent seek, so chained seeks build on its target. */
+  const lastSeek = useRef({ target: 0, at: 0 });
 
-  /**
-   * What to put back after a reload. Set just before the source changes,
-   * consumed in stages: the seek on load, the track choices once the new
-   * instance has listed its tracks, the pause once it is actually playing.
-   */
-  const restoreRef = useRef<{
-    time: number;
-    audioId: number;
-    subtitleId: number;
-    paused: boolean;
-    /** An external file re-selects itself when re-attached. */
-    externalSub: boolean;
-  } | null>(null);
-  const pendingTracks = useRef<typeof restoreRef.current>(null);
+  /** Remembered track choices, applied once the new player lists its tracks. */
+  const pendingTracks = useRef<SubtitlePref | null>(null);
+  /** A reload made while paused: let it autoplay to a frame, then pause. */
+  const reloadPaused = useRef(false);
   const pendingPause = useRef(false);
+  /** A fresh native player starts at 100% volume and must be told otherwise. */
+  const pendingVolumeSync = useRef(false);
 
   const refreshTracks = useCallback((windowMs: number) => {
     trackPollUntil.current = Math.max(
@@ -159,24 +161,28 @@ export default function VideoPlayerScreen() {
     const audio = next.audio.filter((t) => t.id >= 0);
     const subtitle = next.subtitle.filter((t) => t.id >= 0);
 
-    // Track ids come from the demuxer, so they are stable across a reload of
-    // the same file and the previous choice can be put straight back.
+    // Put back the tracks chosen for this title last time. Waits for the
+    // audio list, which arrives in the same batch as the subtitle streams.
     const pending = pendingTracks.current;
     if (pending && audio.length > 0) {
       pendingTracks.current = null;
-      if (
-        pending.audioId !== next.audioIndex &&
-        audio.some((t) => t.id === pending.audioId)
-      ) {
-        player.current?.selectAudioTrack(pending.audioId);
+
+      const audioPick = pending.audioTrack
+        ? matchTrack(audio, pending.audioTrack)
+        : undefined;
+      if (audioPick && audioPick.id !== next.audioIndex) {
+        player.current?.selectAudioTrack(audioPick.id);
       }
-      if (
-        !pending.externalSub &&
-        pending.subtitleId !== next.subtitleIndex &&
-        (pending.subtitleId < 0 ||
-          subtitle.some((t) => t.id === pending.subtitleId))
-      ) {
-        player.current?.selectSubtitleTrack(pending.subtitleId);
+
+      // A loaded subtitle file selects itself, and wins over an embedded pick.
+      if (!pending.fileUri && pending.subtitleTrack) {
+        const subtitleId =
+          pending.subtitleTrack.id < 0
+            ? -1
+            : matchTrack(subtitle, pending.subtitleTrack)?.id;
+        if (subtitleId !== undefined && subtitleId !== next.subtitleIndex) {
+          player.current?.selectSubtitleTrack(subtitleId);
+        }
       }
       refreshTracks(TRACK_SETTLE_MS);
     }
@@ -201,8 +207,6 @@ export default function VideoPlayerScreen() {
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrubbing = useRef(false);
   const lastRecorded = useRef(0);
-  /** Resume is applied once per title, on the first load after the id changes. */
-  const resumedFor = useRef<string | null>(null);
 
   // Position drives the scrub bar from the UI thread, so a 4 Hz progress event
   // doesn't re-render the whole overlay.
@@ -224,8 +228,29 @@ export default function VideoPlayerScreen() {
    * is tracked separately from the live preference, and catching up means a
    * reload.
    */
-  const liveStyle = useSubtitleStyle();
-  const [appliedStyle, setAppliedStyle] = useState(getSubtitleStyle);
+  const [session, setSession] = useState(() => ({
+    style: getSubtitleStyle(),
+    /**
+     * Where the stream opens, in seconds. Passed as libVLC's `:start-time`
+     * rather than seeking after load: a seek issued while the stream is still
+     * opening can be dropped or stall a network file, which is how playback
+     * occasionally sat on the spinner forever.
+     */
+    startAt: 0,
+  }));
+
+  /** Player volume, 0–200, carried over from the last viewing. */
+  const [volume, setVolume] = useState(() => getPlayerLevels().volume);
+  const handleVolumeChange = useCallback((next: number) => {
+    setVolume(next);
+    setPlayerLevels({ volume: next });
+  }, []);
+  /**
+   * Bumped to re-send `volume` to a rebuilt player. The prop is a double that
+   * the native side truncates to an int, so a tiny offset changes the prop
+   * without changing the level.
+   */
+  const [volumeEpoch, setVolumeEpoch] = useState(0);
 
   const source = useMemo(
     () =>
@@ -234,10 +259,14 @@ export default function VideoPlayerScreen() {
             uri: sourceUri,
             autoplay: true,
             isNetwork: !sourceUri.startsWith("file:"),
-            initOptions: subtitleInitOptions(appliedStyle),
+            initOptions: subtitleInitOptions(session.style),
+            mediaOptions:
+              session.startAt > 0
+                ? [`:start-time=${session.startAt.toFixed(2)}`]
+                : [],
           }
         : undefined,
-    [sourceUri, appliedStyle]
+    [sourceUri, session]
   );
 
   /* ------------------------------ orientation ----------------------------- */
@@ -324,19 +353,39 @@ export default function VideoPlayerScreen() {
   }, [playing, revealControls]);
 
   const seekTo = useCallback(
-    (seconds: number) => {
+    (seconds: number, reveal = true) => {
       const clamped = Math.min(Math.max(seconds, 0), duration || seconds);
       player.current?.seek(clamped);
+      lastSeek.current = { target: clamped, at: Date.now() };
+      positionRef.current = clamped;
       setDisplayTime(Math.floor(clamped));
       if (duration > 0) progress.value = clamped / duration;
-      revealControls();
+      if (reveal) revealControls();
     },
     [duration, progress, revealControls]
   );
 
+  const currentPosition = useCallback(
+    () =>
+      Date.now() - lastSeek.current.at < SEEK_SETTLE_MS
+        ? lastSeek.current.target
+        : positionRef.current,
+    []
+  );
+
   const seekBy = useCallback(
-    (delta: number) => seekTo(displayTime + delta),
-    [seekTo, displayTime]
+    (delta: number) => seekTo(currentPosition() + delta),
+    [seekTo, currentPosition]
+  );
+
+  // Gesture seeks leave the controls alone, so watching isn't interrupted.
+  const gestureSeekBy = useCallback(
+    (delta: number) => seekTo(currentPosition() + delta, false),
+    [seekTo, currentPosition]
+  );
+  const gestureSeekTo = useCallback(
+    (seconds: number) => seekTo(seconds, false),
+    [seekTo]
   );
 
   const handleClose = useCallback(() => {
@@ -416,7 +465,11 @@ export default function VideoPlayerScreen() {
       player.current?.setSubtitleFile(stored);
 
       setSubLabel(asset.name);
-      setSubtitlePref(video.id, { fileUri: stored, label: asset.name });
+      setSubtitlePref(video.id, {
+        fileUri: stored,
+        label: asset.name,
+        subtitleTrack: undefined,
+      });
 
       // Re-apply the stored shift to the newly loaded file.
       player.current?.setSubtitleDelay(Math.round(subPref.offset * 1_000_000));
@@ -432,38 +485,78 @@ export default function VideoPlayerScreen() {
   }, [video, subPref.offset, refreshTracks]);
 
   /**
-   * Apply a changed subtitle style by rebuilding the player, then put back
-   * where it was: position, chosen tracks, and paused state.
+   * Apply a changed subtitle style live, shortly after the last tap.
+   *
+   * libVLC only reads text-render options when an instance is built, so a new
+   * style means rebuilding the player at the same position — a brief rebuffer.
+   * Waiting for a quiet moment folds a run of taps into one rebuild.
    */
+  const liveStyle = useSubtitleStyle();
+
   useEffect(() => {
-    if (sameSubtitleStyle(liveStyle, appliedStyle)) return;
+    if (sameSubtitleStyle(liveStyle, session.style)) return;
     const timer = setTimeout(() => {
-      restoreRef.current = {
-        time: positionRef.current,
-        audioId: tracks.audioIndex,
-        subtitleId: tracks.subtitleIndex,
-        paused: !playing,
-        externalSub: !!subLabel,
-      };
+      // The library's paused flag survives into the rebuilt player and stops
+      // it from autoplaying — which never fires the open event, so the spinner
+      // spun forever. Unpause first; `onPlaying` pauses again once it has a
+      // frame.
+      reloadPaused.current = !playing;
+      setPlaying(true);
       setBuffering(true);
-      setAppliedStyle(liveStyle);
+      setSession({ style: getSubtitleStyle(), startAt: currentPosition() });
     }, STYLE_APPLY_DELAY_MS);
     return () => clearTimeout(timer);
-  }, [
-    liveStyle,
-    appliedStyle,
-    tracks.audioIndex,
-    tracks.subtitleIndex,
-    playing,
-    subLabel,
-  ]);
+  }, [liveStyle, session.style, playing, currentPosition]);
+
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+
+  /** Switch tracks and remember the choice for this title. */
+  const handleSelectAudio = useCallback(
+    (trackId: number) => {
+      player.current?.selectAudioTrack(trackId);
+      refreshTracks(TRACK_SETTLE_MS);
+      const track = tracks.audio.find((t) => t.id === trackId);
+      if (video && track) {
+        setSubtitlePref(video.id, {
+          audioTrack: { id: track.id, name: track.name },
+        });
+      }
+    },
+    [video, tracks.audio, refreshTracks]
+  );
+
+  const handleSelectSubtitle = useCallback(
+    (trackId: number) => {
+      player.current?.selectSubtitleTrack(trackId);
+      refreshTracks(TRACK_SETTLE_MS);
+      if (!video) return;
+      const track = tracks.subtitle.find((t) => t.id === trackId);
+      // Choosing a track over a loaded file means moving off that file, so
+      // forget it too — otherwise it would re-select itself next time.
+      setSubtitlePref(video.id, {
+        subtitleTrack: track
+          ? { id: track.id, name: track.name }
+          : { id: -1, name: "" },
+        fileUri: undefined,
+        label: undefined,
+      });
+      setSubLabel(null);
+    },
+    [video, tracks.subtitle, refreshTracks]
+  );
 
   const handleSubtitleClear = useCallback(() => {
     player.current?.selectSubtitleTrack(-1);
     setSubLabel(null);
     setSubError(null);
     // Forget the file too, so reopening the title doesn't restore it.
-    if (video) setSubtitlePref(video.id, { fileUri: undefined, label: undefined });
+    if (video) {
+      setSubtitlePref(video.id, {
+        fileUri: undefined,
+        label: undefined,
+        subtitleTrack: { id: -1, name: "" },
+      });
+    }
   }, [video]);
 
   const handleOffsetChange = useCallback(
@@ -475,6 +568,15 @@ export default function VideoPlayerScreen() {
 
   /* --------------------------------- data --------------------------------- */
 
+  /** Show a title, opening it where it was left off. */
+  const begin = useCallback((next: Video) => {
+    const startAt = getResumePosition(next.id);
+    positionRef.current = startAt;
+    setDisplayTime(Math.floor(startAt));
+    setSession((prev) => ({ ...prev, startAt }));
+    setVideo(next);
+  }, []);
+
   const fetchVideoDetails = useCallback(async () => {
     /**
      * A completed download is self-sufficient: it carries the title, artwork,
@@ -483,7 +585,7 @@ export default function VideoPlayerScreen() {
      */
     const offline = getDownload(id);
     if (offline?.state === "completed") {
-      setVideo({
+      begin({
         id: offline.id,
         title: offline.title,
         description: "",
@@ -521,9 +623,9 @@ export default function VideoPlayerScreen() {
 
         const episode = findEpisode(show, id);
         if (!episode) throw new Error("Episode not found");
-        setVideo(episode);
+        begin(episode);
       } else {
-        setVideo(
+        begin(
           apiService.convertIndividualPostToVideo(
             await apiService.fetchIndividualPost(id)
           )
@@ -536,7 +638,7 @@ export default function VideoPlayerScreen() {
     } finally {
       setLoadingMeta(false);
     }
-  }, [id]);
+  }, [id, begin]);
 
   useEffect(() => {
     fetchVideoDetails();
@@ -626,30 +728,13 @@ export default function VideoPlayerScreen() {
       // Every open, not just the first per title: a new source means new tracks.
       refreshTracks(TRACK_DISCOVERY_MS);
 
-      // A reload for a subtitle-style change: carry on exactly where we were,
-      // rather than treating it as a fresh open of the title.
-      const restore = restoreRef.current;
-      if (restore) {
-        restoreRef.current = null;
-        if (restore.time > 0) {
-          player.current?.seek(restore.time);
-          setDisplayTime(Math.floor(restore.time));
-        }
-        pendingTracks.current = restore;
-        pendingPause.current = restore.paused;
-        if (video) reattachSubtitleFile(video.id);
-        return;
-      }
-
-      if (!video || resumedFor.current === video.id) return;
-      resumedFor.current = video.id;
-
-      const resumeAt = getResumePosition(video.id);
-      if (resumeAt > 0) {
-        player.current?.seek(resumeAt);
-        setDisplayTime(Math.floor(resumeAt));
-      }
-
+      // Each open builds a fresh native player, so everything chosen for this
+      // title goes back on: tracks, the subtitle file, volume, paused state.
+      pendingPause.current = reloadPaused.current;
+      reloadPaused.current = false;
+      pendingVolumeSync.current = true;
+      if (!video) return;
+      pendingTracks.current = getSubtitlePref(video.id);
       reattachSubtitleFile(video.id);
     },
     [video, refreshTracks, reattachSubtitleFile]
@@ -759,6 +844,7 @@ export default function VideoPlayerScreen() {
         // aspect doesn't match the device, so it's a toggle, not a fixed choice.
         resizeMode={zoomed ? "cover" : "contain"}
         progressUpdateInterval={PROGRESS_MS}
+        volume={volume + (volumeEpoch % 2) * 0.001}
         // A video player has no business continuing in the background, and a
         // now-playing entry for it would be noise in the notification shade.
         continueAudioInBackground={false}
@@ -766,6 +852,10 @@ export default function VideoPlayerScreen() {
         onLoad={handleLoad}
         onProgress={handleProgress}
         onPlaying={() => {
+          if (pendingVolumeSync.current) {
+            pendingVolumeSync.current = false;
+            if (volume !== 100) setVolumeEpoch((n) => n + 1);
+          }
           // Reloaded while paused: autoplay is what gets a frame on screen, so
           // let it start, then stop again.
           if (pendingPause.current) {
@@ -782,7 +872,14 @@ export default function VideoPlayerScreen() {
         // just when it stalls, and it carries `isBuffering` computed natively as
         // "not currently playing". Hardcoding `true` here pinned the spinner on
         // permanently the moment playback started.
-        onBuffer={(e) => setBuffering(e.isBuffering ?? false)}
+        //
+        // `isBuffering` alone is also true for the whole time playback is
+        // paused, and while paused no progress events arrive to clear it — so a
+        // seek while paused left the spinner up forever. The fill level is what
+        // says the new position has actually loaded.
+        onBuffer={(e) =>
+          setBuffering(!!e.isBuffering && (e.bufferRate ?? 100) < 100)
+        }
         onTracks={handleTracks}
         onEnd={() => {
           setPlaying(false);
@@ -795,7 +892,15 @@ export default function VideoPlayerScreen() {
         }
       />
 
-      <DoubleTapSeek onSeek={seekBy} onSingleTap={toggleControls}>
+      <PlayerGestures
+        duration={duration}
+        progress={progress}
+        volume={volume}
+        onVolumeChange={handleVolumeChange}
+        onSeekBy={gestureSeekBy}
+        onSeekTo={gestureSeekTo}
+        onSingleTap={toggleControls}
+      >
         <VideoControls
           visible={controlsVisible}
           title={video.title}
@@ -826,21 +931,14 @@ export default function VideoPlayerScreen() {
           onOpenSettings={() => setSettingsOpen(true)}
           onClose={handleClose}
         />
-      </DoubleTapSeek>
+      </PlayerGestures>
 
       <SettingsPanel
         visible={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={closeSettings}
         tracks={tracks}
-        // Re-read after switching so the panel shows what is actually active.
-        onSelectAudio={(trackId) => {
-          player.current?.selectAudioTrack(trackId);
-          refreshTracks(TRACK_SETTLE_MS);
-        }}
-        onSelectSubtitle={(trackId) => {
-          player.current?.selectSubtitleTrack(trackId);
-          refreshTracks(TRACK_SETTLE_MS);
-        }}
+        onSelectAudio={handleSelectAudio}
+        onSelectSubtitle={handleSelectSubtitle}
         external={{
           activeLabel: subLabel,
           loading: subLoading,

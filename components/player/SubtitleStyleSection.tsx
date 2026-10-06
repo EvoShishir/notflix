@@ -1,6 +1,7 @@
 import { AppText } from "@/components/ui/AppText";
 import { PressableScale } from "@/components/ui/PressableScale";
 import {
+  FontFamily,
   IconSize,
   Palette,
   Radius,
@@ -16,11 +17,13 @@ import {
   type SubtitleColor,
   type SubtitleOutline,
   type SubtitleSize,
+  type SubtitleStyle,
+  subtitleRelFontSize,
   useSubtitleStyle,
 } from "@/lib/subtitleStyle";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import React from "react";
-import { StyleSheet, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 
 interface Choice<T> {
   value: T;
@@ -92,6 +95,72 @@ const ON_OFF: Choice<boolean>[] = [
   { value: true, label: "On" },
 ];
 
+/** Height of the preview frame; text scales from it the way libVLC's does. */
+const PREVIEW_HEIGHT = 120;
+
+/**
+ * An approximation of the look, drawn by React Native.
+ *
+ * libVLC renders the real thing with its own font engine and only picks up a
+ * new style when the player is rebuilt, so this is what makes editing feel
+ * immediate. React Native has one text shadow, so outline and shadow share it.
+ */
+function StylePreview({ style }: { style: SubtitleStyle }) {
+  // libVLC sizes text as picture height over the divisor; scaled up a little
+  // so the small frame stays legible.
+  const fontSize = (PREVIEW_HEIGHT / subtitleRelFontSize(style.size)) * 1.5;
+  const outlineRadius = { none: 0, thin: 1.5, normal: 2.5, thick: 4 }[
+    style.outline
+  ];
+
+  const shadow =
+    outlineRadius > 0
+      ? {
+          textShadowColor: "#000000",
+          textShadowRadius: outlineRadius,
+          textShadowOffset: style.shadow
+            ? { width: 1.5, height: 1.5 }
+            : { width: 0, height: 0 },
+        }
+      : style.shadow
+        ? {
+            textShadowColor: "rgba(0, 0, 0, 0.7)",
+            textShadowRadius: 2,
+            textShadowOffset: { width: 2, height: 2 },
+          }
+        : null;
+
+  return (
+    <View
+      style={styles.preview}
+      accessible
+      accessibilityLabel="Subtitle preview"
+    >
+      <View
+        style={[
+          styles.previewLine,
+          { bottom: Spacing.xs + style.position * (PREVIEW_HEIGHT * 0.06) },
+        ]}
+      >
+        <Text
+          style={[
+            {
+              fontSize,
+              lineHeight: fontSize * 1.25,
+              color: style.color === "yellow" ? "#FFFF00" : "#FFFFFF",
+              fontFamily: style.bold ? FontFamily.bold : FontFamily.regular,
+            },
+            shadow,
+            style.background && styles.previewBox,
+          ]}
+        >
+          This is how subtitles look
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 interface SubtitleStyleSectionProps {
   expanded: boolean;
   onToggle: () => void;
@@ -100,10 +169,10 @@ interface SubtitleStyleSectionProps {
 /**
  * Subtitle appearance.
  *
- * Changes are written straight to the store; the player debounces them and
- * reloads the stream at the same position, since libVLC only reads text-render
- * options when it starts. The video stays visible beside the panel, so the
- * result shows up live a moment after each tap.
+ * Changes are written straight to the store and previewed here at once. The
+ * player applies them to the video shortly after the last tap: libVLC only
+ * reads text-render options when it starts, so applying means a brief reload
+ * at the same position.
  */
 export function SubtitleStyleSection({
   expanded,
@@ -144,6 +213,8 @@ export function SubtitleStyleSection({
 
       {expanded && (
         <View style={styles.panel}>
+          <StylePreview style={style} />
+
           <Segmented
             label="Size"
             choices={SIZES}
@@ -226,8 +297,8 @@ export function SubtitleStyleSection({
           />
 
           <AppText variant="caption" tone="muted" style={styles.note}>
-            The video reloads briefly to apply changes. Styled .ass subtitles
-            keep their own look.
+            Changes apply to the video after a brief rebuffer. Styled .ass
+            subtitles keep their own look.
           </AppText>
 
           {!isDefault && (
@@ -256,6 +327,25 @@ export function SubtitleStyleSection({
 
 const styles = StyleSheet.create({
   group: { marginBottom: Spacing.xs },
+  preview: {
+    height: PREVIEW_HEIGHT,
+    marginHorizontal: Spacing.xs,
+    borderRadius: Radius.md,
+    overflow: "hidden",
+    // A dim, mid-grey "scene": dark enough to judge contrast, light enough
+    // that an outline-free white subtitle visibly struggles.
+    backgroundColor: "#3A4150",
+  },
+  previewLine: {
+    position: "absolute",
+    left: Spacing.xs,
+    right: Spacing.xs,
+    alignItems: "center",
+  },
+  previewBox: {
+    backgroundColor: "rgba(0, 0, 0, 0.63)",
+    paddingHorizontal: Spacing.xxs,
+  },
   trigger: {
     minHeight: TouchTarget + Spacing.xs,
     flexDirection: "row",
