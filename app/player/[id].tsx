@@ -13,6 +13,12 @@ import {
   subtitleFileExists,
   useSubtitlePref,
 } from "@/lib/subtitles";
+import {
+  getSubtitleStyle,
+  sameSubtitleStyle,
+  subtitleInitOptions,
+  useSubtitleStyle,
+} from "@/lib/subtitleStyle";
 import { getResumePosition, recordProgress } from "@/lib/watchProgress";
 import { apiService } from "@/services/api";
 import { Episode, TVShow, Video } from "@/types";
@@ -42,6 +48,31 @@ const EPISODE_ID = /-s\d+-e\d+$/;
 const AUTO_HIDE_MS = 3500;
 /** Progress cadence: smooth enough for the scrub bar, cheap enough to ignore. */
 const PROGRESS_MS = 250;
+/**
+ * How long to keep re-reading the track list after the media opens.
+ *
+ * `onLoad` fires on libVLC's Opening event, before the demuxer has registered
+ * any streams, so a `getTracks()` there returns empty lists — and the library
+ * never emits `onTracks` on its own. Polling on progress ticks for a window
+ * covers however long the container takes to parse over the network.
+ */
+const TRACK_DISCOVERY_MS = 15_000;
+/** Track selection and sidecar loading are applied on libVLC's input thread. */
+const TRACK_SETTLE_MS = 2_000;
+/**
+ * Quiet period before a subtitle-style change is applied. Applying means
+ * reloading the stream, so a burst of taps in the panel should cost one reload.
+ */
+const STYLE_APPLY_DELAY_MS = 700;
+
+type Track = VLCPlayerTracks["audio"][number];
+
+function sameTrackList(a: Track[], b: Track[]) {
+  return (
+    a.length === b.length &&
+    a.every((t, i) => t.id === b[i].id && t.name === b[i].name)
+  );
+}
 
 function findEpisode(show: TVShow, episodeId: string): Episode | null {
   for (const season of show.seasons) {
@@ -91,6 +122,82 @@ export default function VideoPlayerScreen() {
     subtitleIndex: -1,
   });
 
+  /** Progress ticks re-request tracks until this timestamp. */
+  const trackPollUntil = useRef(0);
+
+  /** Latest playback position in seconds, for restoring after a reload. */
+  const positionRef = useRef(0);
+
+  /**
+   * What to put back after a reload. Set just before the source changes,
+   * consumed in stages: the seek on load, the track choices once the new
+   * instance has listed its tracks, the pause once it is actually playing.
+   */
+  const restoreRef = useRef<{
+    time: number;
+    audioId: number;
+    subtitleId: number;
+    paused: boolean;
+    /** An external file re-selects itself when re-attached. */
+    externalSub: boolean;
+  } | null>(null);
+  const pendingTracks = useRef<typeof restoreRef.current>(null);
+  const pendingPause = useRef(false);
+
+  const refreshTracks = useCallback((windowMs: number) => {
+    trackPollUntil.current = Math.max(
+      trackPollUntil.current,
+      Date.now() + windowMs
+    );
+    player.current?.getTracks();
+  }, []);
+
+  const handleTracks = useCallback((next: VLCPlayerTracks) => {
+    // libVLC lists a "Disable" pseudo-track (id -1) in both lists. The panel
+    // supplies its own "Off" for subtitles, and nobody wants to mute audio
+    // from a track picker.
+    const audio = next.audio.filter((t) => t.id >= 0);
+    const subtitle = next.subtitle.filter((t) => t.id >= 0);
+
+    // Track ids come from the demuxer, so they are stable across a reload of
+    // the same file and the previous choice can be put straight back.
+    const pending = pendingTracks.current;
+    if (pending && audio.length > 0) {
+      pendingTracks.current = null;
+      if (
+        pending.audioId !== next.audioIndex &&
+        audio.some((t) => t.id === pending.audioId)
+      ) {
+        player.current?.selectAudioTrack(pending.audioId);
+      }
+      if (
+        !pending.externalSub &&
+        pending.subtitleId !== next.subtitleIndex &&
+        (pending.subtitleId < 0 ||
+          subtitle.some((t) => t.id === pending.subtitleId))
+      ) {
+        player.current?.selectSubtitleTrack(pending.subtitleId);
+      }
+      refreshTracks(TRACK_SETTLE_MS);
+    }
+
+    // Polling delivers identical payloads several times a second; keep the
+    // previous object so the screen doesn't re-render for nothing.
+    setTracks((prev) =>
+      prev.audioIndex === next.audioIndex &&
+      prev.subtitleIndex === next.subtitleIndex &&
+      sameTrackList(prev.audio, audio) &&
+      sameTrackList(prev.subtitle, subtitle)
+        ? prev
+        : {
+            audio,
+            audioIndex: next.audioIndex,
+            subtitle,
+            subtitleIndex: next.subtitleIndex,
+          }
+    );
+  }, [refreshTracks]);
+
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrubbing = useRef(false);
   const lastRecorded = useRef(0);
@@ -111,6 +218,15 @@ export default function VideoPlayerScreen() {
     return getPlayableUri(video.id) ?? video.videoUrl ?? null;
   }, [video]);
 
+  /**
+   * Subtitle styling lives in LibVLC *instance* options, which the library only
+   * reads when a new `source` arrives — so the style the player was built with
+   * is tracked separately from the live preference, and catching up means a
+   * reload.
+   */
+  const liveStyle = useSubtitleStyle();
+  const [appliedStyle, setAppliedStyle] = useState(getSubtitleStyle);
+
   const source = useMemo(
     () =>
       sourceUri
@@ -118,9 +234,10 @@ export default function VideoPlayerScreen() {
             uri: sourceUri,
             autoplay: true,
             isNetwork: !sourceUri.startsWith("file:"),
+            initOptions: subtitleInitOptions(appliedStyle),
           }
         : undefined,
-    [sourceUri]
+    [sourceUri, appliedStyle]
   );
 
   /* ------------------------------ orientation ----------------------------- */
@@ -303,7 +420,8 @@ export default function VideoPlayerScreen() {
 
       // Re-apply the stored shift to the newly loaded file.
       player.current?.setSubtitleDelay(Math.round(subPref.offset * 1_000_000));
-      player.current?.getTracks();
+      // The slave is attached asynchronously, so its track appears a beat later.
+      refreshTracks(TRACK_SETTLE_MS);
     } catch (e) {
       setSubError(
         e instanceof Error ? e.message : "That file could not be loaded."
@@ -311,7 +429,34 @@ export default function VideoPlayerScreen() {
     } finally {
       setSubLoading(false);
     }
-  }, [video, subPref.offset]);
+  }, [video, subPref.offset, refreshTracks]);
+
+  /**
+   * Apply a changed subtitle style by rebuilding the player, then put back
+   * where it was: position, chosen tracks, and paused state.
+   */
+  useEffect(() => {
+    if (sameSubtitleStyle(liveStyle, appliedStyle)) return;
+    const timer = setTimeout(() => {
+      restoreRef.current = {
+        time: positionRef.current,
+        audioId: tracks.audioIndex,
+        subtitleId: tracks.subtitleIndex,
+        paused: !playing,
+        externalSub: !!subLabel,
+      };
+      setBuffering(true);
+      setAppliedStyle(liveStyle);
+    }, STYLE_APPLY_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [
+    liveStyle,
+    appliedStyle,
+    tracks.audioIndex,
+    tracks.subtitleIndex,
+    playing,
+    subLabel,
+  ]);
 
   const handleSubtitleClear = useCallback(() => {
     player.current?.selectSubtitleTrack(-1);
@@ -431,6 +576,9 @@ export default function VideoPlayerScreen() {
       // we are playing.
       setBuffering(false);
 
+      positionRef.current = currentTime;
+      if (Date.now() < trackPollUntil.current) player.current?.getTracks();
+
       const whole = Math.floor(currentTime);
       setDisplayTime((prev) => (prev === whole ? prev : whole));
 
@@ -442,10 +590,56 @@ export default function VideoPlayerScreen() {
     [video, progressMeta, progress]
   );
 
+  /**
+   * Re-attach the subtitle file chosen previously for a title.
+   *
+   * Checked against disk rather than trusted blindly: the user may have
+   * cleared app storage since, and handing libVLC a missing path would
+   * silently leave them with no subtitles and no explanation.
+   */
+  const reattachSubtitleFile = useCallback(
+    (videoId: string) => {
+      const pref = getSubtitlePref(videoId);
+      if (!pref.fileUri) return;
+      void subtitleFileExists(pref.fileUri).then((exists) => {
+        if (!exists) {
+          setSubtitlePref(videoId, {
+            fileUri: undefined,
+            label: undefined,
+          });
+          return;
+        }
+        player.current?.setSubtitleFile(pref.fileUri!);
+        player.current?.setSubtitleDelay(Math.round(pref.offset * 1_000_000));
+        setSubLabel(pref.label ?? "Subtitle file");
+        refreshTracks(TRACK_SETTLE_MS);
+      });
+    },
+    [refreshTracks]
+  );
+
   const handleLoad = useCallback(
     ({ duration: total }: { duration: number }) => {
       setBuffering(false);
       if (total > 0) setDuration(total);
+
+      // Every open, not just the first per title: a new source means new tracks.
+      refreshTracks(TRACK_DISCOVERY_MS);
+
+      // A reload for a subtitle-style change: carry on exactly where we were,
+      // rather than treating it as a fresh open of the title.
+      const restore = restoreRef.current;
+      if (restore) {
+        restoreRef.current = null;
+        if (restore.time > 0) {
+          player.current?.seek(restore.time);
+          setDisplayTime(Math.floor(restore.time));
+        }
+        pendingTracks.current = restore;
+        pendingPause.current = restore.paused;
+        if (video) reattachSubtitleFile(video.id);
+        return;
+      }
 
       if (!video || resumedFor.current === video.id) return;
       resumedFor.current = video.id;
@@ -456,33 +650,9 @@ export default function VideoPlayerScreen() {
         setDisplayTime(Math.floor(resumeAt));
       }
 
-      // Track lists only exist once the media has been parsed.
-      player.current?.getTracks();
-
-      /**
-       * Re-attach a subtitle file chosen previously for this title.
-       *
-       * Checked against disk rather than trusted blindly: the user may have
-       * cleared app storage since, and handing libVLC a missing path would
-       * silently leave them with no subtitles and no explanation.
-       */
-      const pref = getSubtitlePref(video.id);
-      if (pref.fileUri) {
-        void subtitleFileExists(pref.fileUri).then((exists) => {
-          if (!exists) {
-            setSubtitlePref(video.id, {
-              fileUri: undefined,
-              label: undefined,
-            });
-            return;
-          }
-          player.current?.setSubtitleFile(pref.fileUri!);
-          player.current?.setSubtitleDelay(Math.round(pref.offset * 1_000_000));
-          setSubLabel(pref.label ?? "Subtitle file");
-        });
-      }
+      reattachSubtitleFile(video.id);
     },
-    [video]
+    [video, refreshTracks, reattachSubtitleFile]
   );
 
   /**
@@ -596,6 +766,14 @@ export default function VideoPlayerScreen() {
         onLoad={handleLoad}
         onProgress={handleProgress}
         onPlaying={() => {
+          // Reloaded while paused: autoplay is what gets a frame on screen, so
+          // let it start, then stop again.
+          if (pendingPause.current) {
+            pendingPause.current = false;
+            player.current?.pause();
+            setBuffering(false);
+            return;
+          }
           setPlaying(true);
           setBuffering(false);
         }}
@@ -605,7 +783,7 @@ export default function VideoPlayerScreen() {
         // "not currently playing". Hardcoding `true` here pinned the spinner on
         // permanently the moment playback started.
         onBuffer={(e) => setBuffering(e.isBuffering ?? false)}
-        onTracks={setTracks}
+        onTracks={handleTracks}
         onEnd={() => {
           setPlaying(false);
           revealControls(true);
@@ -654,10 +832,15 @@ export default function VideoPlayerScreen() {
         visible={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         tracks={tracks}
-        onSelectAudio={(trackId) => player.current?.selectAudioTrack(trackId)}
-        onSelectSubtitle={(trackId) =>
-          player.current?.selectSubtitleTrack(trackId)
-        }
+        // Re-read after switching so the panel shows what is actually active.
+        onSelectAudio={(trackId) => {
+          player.current?.selectAudioTrack(trackId);
+          refreshTracks(TRACK_SETTLE_MS);
+        }}
+        onSelectSubtitle={(trackId) => {
+          player.current?.selectSubtitleTrack(trackId);
+          refreshTracks(TRACK_SETTLE_MS);
+        }}
         external={{
           activeLabel: subLabel,
           loading: subLoading,

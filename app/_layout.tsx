@@ -23,6 +23,7 @@ import { useMotionEnabled } from "@/components/ui/Motion";
 import { Duration, FontFamily, Palette } from "@/constants/theme";
 import { DataProvider } from "@/contexts/DataContext";
 import { hydrateDownloads } from "@/lib/downloads";
+import { hydrateSubtitleStyle } from "@/lib/subtitleStyle";
 import { hydrateSubtitlePrefs } from "@/lib/subtitles";
 import { hydrateWatchProgress } from "@/lib/watchProgress";
 
@@ -83,6 +84,7 @@ export default function RootLayout() {
     void hydrateWatchProgress();
     void hydrateDownloads();
     void hydrateSubtitlePrefs();
+    void hydrateSubtitleStyle();
   }, []);
 
   useEffect(() => {

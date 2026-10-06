@@ -29,8 +29,10 @@ import Animated, {
   SlideOutRight,
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useScreenHeight } from "@/hooks/useScreenHeight";
 import { ExternalSubtitles } from "./ExternalSubtitles";
 import { DropdownOption, OptionDropdown } from "./OptionDropdown";
+import { SubtitleStyleSection } from "./SubtitleStyleSection";
 
 /** libVLC uses -1 to mean "no subtitle track". */
 const SUBTITLES_OFF = -1;
@@ -95,6 +97,7 @@ export function SettingsPanel({
   onSelectSubtitle,
 }: SettingsPanelProps) {
   const insets = useSafeAreaInsets();
+  const screenHeight = useScreenHeight();
   const motion = useMotionEnabled();
   const { width } = useWindowDimensions();
 
@@ -151,7 +154,7 @@ export function SettingsPanel({
       <Animated.View
         entering={motion ? FadeIn.duration(Duration.fast) : undefined}
         exiting={motion ? FadeOut.duration(Duration.instant) : undefined}
-        style={styles.backdrop}
+        style={[styles.backdrop, { height: screenHeight }]}
       >
         {/* Tapping the video still showing on the left closes the panel. */}
         <Pressable
@@ -240,10 +243,15 @@ export function SettingsPanel({
               onToggle={() => toggleGroup("external")}
             />
 
+            <SubtitleStyleSection
+              expanded={openGroup === "style"}
+              onToggle={() => toggleGroup("style")}
+            />
+
             {tracks.subtitle.length === 0 && (
               <AppText variant="small" tone="muted" style={styles.note}>
-                This file has no embedded subtitles. Search online above to add
-                some.
+                This file has no embedded subtitles. Load a subtitle file from
+                your device above.
               </AppText>
             )}
           </ScrollView>
@@ -255,7 +263,11 @@ export function SettingsPanel({
 
 const styles = StyleSheet.create({
   backdrop: {
-    flex: 1,
+    // Height comes from useScreenHeight; flex: 1 stops short on Android.
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
     flexDirection: "row",
     justifyContent: "flex-end",
     backgroundColor: "rgba(0, 0, 0, 0.55)",

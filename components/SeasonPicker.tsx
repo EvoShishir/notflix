@@ -22,6 +22,7 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useScreenHeight } from "@/hooks/useScreenHeight";
 import { AppText } from "./ui/AppText";
 import { useMotionEnabled } from "./ui/Motion";
 import { PressableScale } from "./ui/PressableScale";
@@ -47,6 +48,7 @@ export function SeasonPicker({
 }: SeasonPickerProps) {
   const [open, setOpen] = useState(false);
   const insets = useSafeAreaInsets();
+  const screenHeight = useScreenHeight();
   const motion = useMotionEnabled();
   const chevron = useSharedValue(0);
 
@@ -136,7 +138,7 @@ export function SeasonPicker({
         <Animated.View
           entering={motion ? FadeIn.duration(Duration.fast) : undefined}
           exiting={motion ? FadeOut.duration(Duration.instant) : undefined}
-          style={styles.backdrop}
+          style={[styles.backdrop, { height: screenHeight }]}
         >
           {/* Tapping outside closes — the sheet below stops the press. */}
           <Pressable
@@ -238,7 +240,11 @@ const styles = StyleSheet.create({
   triggerText: { flex: 1, gap: 2 },
   triggerMeta: { flexDirection: "row", alignItems: "center", gap: Spacing.xs },
   backdrop: {
-    flex: 1,
+    // Height comes from useScreenHeight; flex: 1 stops short on Android.
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
     justifyContent: "flex-end",
     // Measured against the page's true-black ground: dark enough to push the
     // page back without hiding that it is still there.
